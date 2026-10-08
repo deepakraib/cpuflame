@@ -1708,13 +1708,19 @@ def explain_failure(detail: str) -> str:
     return "\n\n".join(parts)
 
 
+def perf_install_text() -> str:
+    return (
+        "Install perf.\n"
+        "On Ubuntu:\n"
+        "  sudo apt-get install linux-tools-$(uname -r) linux-tools-generic -y\n"
+        "On RHEL and clones:\n"
+        "  sudo yum install -y perf"
+    )
+
+
 def require_perf() -> None:
     if shutil.which("perf") is None:
-        raise SystemExit(
-            "perf is not on PATH.\n"
-            "Install it with:\n"
-            "  sudo apt install linux-tools-common linux-tools-$(uname -r)"
-        )
+        raise SystemExit("perf is not on PATH.\n" + perf_install_text())
 
 
 def perf_data_beside(svg_path: str) -> str:
@@ -1764,7 +1770,15 @@ def output_flag(cmd: list[str]) -> str | None:
     return None
 
 
-def record_command(freq: int, call_graph: str, data_path: str, pid: int | None, system: bool, recorded: list[str]) -> list[str]:
+def record_command(
+    freq: int,
+    call_graph: str,
+    data_path: str,
+    pid: str | None,
+    system: bool,
+    recorded: list[str],
+    all_cpus: bool = False,
+) -> list[str]:
     mode = "dwarf,8192" if call_graph == "dwarf" else call_graph
     cmd = [
         "perf", "record",
@@ -1774,10 +1788,11 @@ def record_command(freq: int, call_graph: str, data_path: str, pid: int | None, 
         "--no-buildid-mmap",
         "-o", data_path,
     ]
-    if system:
+    # -a with -p is the usual server capture: every CPU, one process.
+    if system or all_cpus:
         cmd.append("-a")
     if pid is not None:
-        cmd.extend(["-p", str(pid)])
+        cmd.extend(["-p", pid])
     cmd.append("--")
     cmd.extend(recorded)
     return cmd
@@ -1798,14 +1813,31 @@ def validate_rate(freq: int, duration: float | None) -> None:
         raise SystemExit("--duration must be greater than 0")
 
 
-def run_and_draw(args: argparse.Namespace, recorded: list[str], pid: int | None, system: bool, title: str) -> None:
+def pids_for_binary(name: str) -> str:
+    if shutil.which("pgrep") is None:
+        raise SystemExit("pgrep is not on PATH. Pass -p PID instead.")
+    proc = subprocess.run(["pgrep", "-x", name], text=True, capture_output=True)
+    pids = [line.strip() for line in proc.stdout.splitlines() if line.strip().isdigit()]
+    if not pids:
+        raise SystemExit(f"No process named {name} is running.\nStart it, or pass -p PID.")
+    return ",".join(pids)
+
+
+def run_and_draw(
+    args: argparse.Namespace,
+    recorded: list[str],
+    pid: str | None,
+    system: bool,
+    title: str,
+    all_cpus: bool = False,
+) -> None:
     validate_rate(args.freq, getattr(args, "duration", None))
     validate_top(getattr(args, "top", 8))
     record_only = bool(getattr(args, "record_only", False))
     keep = perf_data_beside(args.output) if (args.keep or record_only) else None
     with tempfile.TemporaryDirectory(prefix="cpuflame-") as temp_dir:
         data_path = os.path.join(temp_dir, "perf.data")
-        cmd = record_command(args.freq, args.call_graph, data_path, pid, system, recorded)
+        cmd = record_command(args.freq, args.call_graph, data_path, pid, system, recorded, all_cpus=all_cpus)
         text = record_script(cmd, keep, want_script=not record_only)
     if record_only:
         return
@@ -1831,11 +1863,17 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_attach(args: argparse.Namespace) -> None:
-    if not os.path.isdir(f"/proc/{args.pid}"):
-        raise SystemExit(f"No process with pid {args.pid} is running.")
-    print(f"Recording pid {args.pid} for {args.duration:g}s")
-    title = args.title or f"Flame graph: pid {args.pid}"
-    run_and_draw(args, ["sleep", f"{args.duration:g}"], args.pid, False, title)
+    if args.binary:
+        pid = pids_for_binary(args.binary)
+        label = args.binary
+    else:
+        if not os.path.isdir(f"/proc/{args.pid}"):
+            raise SystemExit(f"No process with pid {args.pid} is running.")
+        pid = str(args.pid)
+        label = f"pid {args.pid}"
+    print(f"Recording {label} on all CPUs for {args.duration:g}s")
+    title = args.title or f"Flame graph: {label}"
+    run_and_draw(args, ["sleep", f"{args.duration:g}"], pid, False, title, all_cpus=True)
 
 
 def cmd_system(args: argparse.Namespace) -> None:
@@ -1916,7 +1954,7 @@ def cmd_check(_args: argparse.Namespace) -> None:
     level = read_paranoid()
     print(f"perf_event_paranoid: {level if level is not None else 'unreadable'}")
     if perf is None:
-        print("Install perf: sudo apt install linux-tools-common linux-tools-$(uname -r)")
+        print(perf_install_text())
         raise SystemExit(1)
     if level is None:
         print("Could not read the paranoid setting. Try a short record to see if perf works.")
@@ -2246,6 +2284,11 @@ other 8 [001] 10.530000:          1 cpu-clock:
     flags = build_parser().parse_args(["run", "--record-only", "--no-report", "-o", "out", "--", "true"])
     expect(flags.record_only and flags.no_report, "record-only with --no-report")
     expect(build_parser().prog == "cpuflame", "tool name")
+    recorded = record_command(99, "fp", "perf.data", "123,456", False, ["sleep", "60"], all_cpus=True)
+    expect(recorded[recorded.index("-a") + 0] == "-a", "attach capture is missing -a")
+    expect(recorded[recorded.index("-p") + 1] == "123,456", "attach capture did not keep every pid")
+    expect(recorded[recorded.index("-g") + 0] == "-g", "attach capture is missing -g")
+    expect("99" in recorded, "attach capture is missing -F 99")
     expect(is_lock("absl::lts_20230802::base_internal::SpinLock::SpinLoop()"), "abseil spin was missed")
     repeated = Node(Frame("all", "root"))
     add_sample(
@@ -2305,16 +2348,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog="""examples:
   cpuflame check
-  cpuflame example -o example.svg --open
-  cpuflame run -o app.svg -- python3 app.py
-  cpuflame run -d 15 -F 99 -o app.svg -- python3 app.py
-  cpuflame attach -p 1234 -d 20 -o proc.svg
-  cpuflame system -d 10 -o system.svg
-  cpuflame graph -i perf.data -o out.svg
-  cpuflame report -i perf.data
-  cpuflame report -i stacks.txt -o report.txt
-  perf script -i perf.data | cpuflame graph -i - -o out.svg
-  cpuflame graph -i stacks.txt -o out.svg
+  binary_to_monitor=mysqld
+  cpuflame attach --binary "$binary_to_monitor" -d 60 -o flamegraph.svg
+  sudo perf record -a -g -F99 -p $(pgrep -x "$binary_to_monitor") -- sleep 60
+  sudo perf script > perf.script
+  cpuflame graph -i perf.script -o flamegraph.svg
+  cpuflame report -i perf.script -o flamegraph.txt
 
 folded stacks look like:  main;foo;bar 12
 """,
@@ -2353,9 +2392,11 @@ folded stacks look like:  main;foo;bar 12
     run.add_argument("command", nargs=argparse.REMAINDER, help="Command to record, after --")
     run.set_defaults(func=cmd_run)
 
-    attach = sub.add_parser("attach", parents=[view, filt, record, words], help="Record a running process")
-    attach.add_argument("-p", "--pid", type=int, required=True, help="Process id to record")
-    attach.add_argument("-d", "--duration", type=float, default=10, help="Seconds to record (default: 10)")
+    attach = sub.add_parser("attach", parents=[view, filt, record, words], help="Record a running process on all CPUs")
+    target = attach.add_mutually_exclusive_group(required=True)
+    target.add_argument("-p", "--pid", type=int, help="Process id to record")
+    target.add_argument("--binary", help="Process name, matched exactly (pgrep -x). Example: mysqld, mongod")
+    attach.add_argument("-d", "--duration", type=float, default=60, help="Seconds to record (default: 60)")
     attach.set_defaults(func=cmd_attach)
 
     system = sub.add_parser("system", parents=[view, filt, record, words], help="Record every CPU")

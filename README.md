@@ -2,77 +2,96 @@
 
 Record a CPU profile with Linux `perf`, draw an interactive flame graph, and write a short report that names the hot frames and what to try next.
 
-One command does all three steps. You do not need `flamegraph.pl`.
+You do not need `flamegraph.pl`. `cpuflame` draws the SVG and writes the report from `perf.data` or from `perf script` output.
 
-Run it from the repository root. `tools/cpuflame` is a file in this repo, not a command on `PATH`.
+Run the commands below from this repository. `tools/cpuflame` is a file in the repo, not a command installed on `PATH`.
 
 ```bash
 git clone git@github.com:deepakraib/cpuflame.git
 cd cpuflame
-python3 tools/cpuflame check
-python3 tools/cpuflame run -o app.svg -- python3 app.py
 ```
 
-That writes `app.svg` and `app.txt` in the current directory. Open the SVG in a browser.
+## Process
 
-## Requirements
+### 1) Install perf
 
-- Linux, with a kernel that has performance events
-- Python 3
-- `perf` on `PATH`, built for the running kernel
+On Ubuntu:
 
-`cpuflame check` says whether this user can record. If recording is blocked it prints the exact fix:
+```bash
+sudo apt-get install linux-tools-$(uname -r) linux-tools-generic -y
+```
+
+On RHEL and clones:
+
+```bash
+sudo yum install -y perf
+```
+
+`perf` must match the running kernel. Python 3 is also required.
+
+`cpuflame check` says whether this user can record. If recording is blocked, it prints:
 
 ```bash
 sudo sysctl kernel.perf_event_paranoid=1
 ```
 
-`1` is enough to profile your own processes, including kernel stacks. `cpuflame system` needs `0`, or run `cpuflame` under `sudo`.
+`1` is enough to profile your own processes, including kernel stacks. Recording every process on the machine needs `0`, or run the capture under `sudo`.
 
-The package name depends on the distribution. On Debian and Ubuntu:
+### 2) Capture performance data with perf
 
-```bash
-sudo apt install linux-tools-common linux-tools-$(uname -r)
-```
-
-On Fedora, RHEL, and SUSE, install the `perf` package that matches the running kernel. `perf` must match that kernel or recording fails.
-
-macOS, Windows, and the BSDs cannot record. `example`, and `graph` / `report` on folded stacks or a `perf script` text file, need only Python 3.
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `cpuflame check` | Say whether this user can record |
-| `cpuflame run -o app.svg -- cmd` | Record a command, write the SVG and the report |
-| `cpuflame attach -p PID -d 20 -o proc.svg` | Record a running process (default 10 seconds) |
-| `cpuflame system -d 10 -o system.svg` | Record every CPU |
-| `cpuflame graph -i perf.data -o out.svg` | Draw the SVG only |
-| `cpuflame report -i perf.data` | Write the report only |
-| `cpuflame example -o example.svg` | Write a sample graph and report, no `perf` |
-| `cpuflame self-test` | Check the parser, the SVG writer, and the report |
-
-`run --duration` needs GNU `timeout` from coreutils. `attach` and `system` use `sleep`.
+In this example, perf captures data from the `mysqld` process for 60 seconds. Change `binary_to_monitor` to the program you want, such as `mongod`, `mysqld`, or `valkey-server`.
 
 ```bash
-python3 tools/cpuflame run -d 15 -F 99 -o app.svg -- python3 app.py
-python3 tools/cpuflame run --keep -o app.svg -- python3 app.py
-python3 tools/cpuflame run --record-only -o app.svg -- python3 app.py
-perf script -i perf.data | python3 tools/cpuflame graph -i - -o out.svg
+binary_to_monitor="mysqld"
+sudo perf record -a -g -F99 -p $(pgrep -x ${binary_to_monitor}) -- sleep 60
 ```
 
-`--keep` saves `perf.data` next to the SVG (`app.svg` becomes `app.perf.data`). `--record-only` saves `perf.data` and stops. `--no-report` writes the SVG only. `-o out` with no `.svg` writes the report to `out.txt`.
+`-a` collects samples from all CPU cores. `-g` records the call graph for the kernel and for user space. `-F99` collects 99 samples per second. `-p` limits the samples to that process.
 
-Useful flags:
+The same capture, drawn as soon as it finishes:
 
-- `-F`, `--freq` samples per second (default 99)
-- `--call-graph fp|dwarf|lbr` stack unwinder (default `fp`). `lbr` is Intel-only
-- `--comm NAME` keep one process (repeatable)
-- `--no-comm` do not add the process name at the base of each stack
-- `--top N` rows in the widest and self-time lists (default 8)
-- `--width`, `--min-width`, `--icicle`, `--title`, `--open`
+```bash
+binary_to_monitor="mysqld"
+sudo python3 tools/cpuflame attach --binary "$binary_to_monitor" -d 60 -o flamegraph.svg
+```
 
-`--open` uses `xdg-open`. On a server the SVG is still written. Open it yourself.
+That runs `perf record -a -g -F 99 -p $(pgrep -x "$binary_to_monitor") -- sleep 60`, then writes `flamegraph.svg` and `flamegraph.txt`.
+
+### 3) Convert the perf data to text
+
+`perf record` writes a binary `perf.data` in the current directory. This turns it into text:
+
+```bash
+sudo perf script > perf.script
+```
+
+The text is readable, and it is the input for the flame graph. If you already have a `perf.script` file from another machine, start at the next step. You do not need `perf` for that.
+
+### 4) Generate the flame graph
+
+```bash
+python3 tools/cpuflame graph -i perf.script -o flamegraph.svg
+python3 tools/cpuflame report -i perf.script -o flamegraph.txt
+```
+
+Open `flamegraph.svg` in a browser. `flamegraph.txt` names the hot frames and what to try next.
+
+From the binary `perf.data` file, skip step 3:
+
+```bash
+python3 tools/cpuflame graph -i perf.data -o flamegraph.svg
+python3 tools/cpuflame report -i perf.data -o flamegraph.txt
+```
+
+Folded stacks also work. A line is a stack and a count:
+
+```text
+main;foo;bar 12
+```
+
+```bash
+python3 tools/cpuflame graph -i stacks.txt -o flamegraph.svg
+```
 
 ## How to read the graph
 
