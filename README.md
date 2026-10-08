@@ -86,14 +86,17 @@ python3 tools/cpuflame html -i perf.script -o flamegraph.html
 python3 tools/cpuflame html -i perf.data -o flamegraph.html
 ```
 
-The page has six parts:
+The page has a sticky section bar, a light and dark theme, and a print layout. It has seven parts:
 
-1. **Sample count and the split.** How many on-CPU samples were captured, and what share is user code versus kernel.
-2. **What is wrong.** One card per finding, largest first. Each card names the frame, the percent, the call path, and the next step. **Highlight in the graph** marks that frame in the picture.
-3. **Conclusion.** Three columns: what is wrong, what to do, and anything unusual in this profile. If symbols are missing, the conclusion says the graph cannot be used to tune the program yet, and how to record again.
-4. **Where the samples went.** Threads that hold at least 1% of the profile. Numbered threads (`conn1`, `conn2`, ...) are merged into one name (`conn*`), and `conn*` is shown as connections with the thread count.
-5. **The flame graph.** The same interactive SVG. The bottom row is the root. Blue is the process, orange is the kernel, yellow is user code. Click a frame to zoom. Type to search. Esc clears.
-6. **Widest frames and where the CPU actually was.** Inclusive time, then self time, each with the path from the root.
+1. **Verdict.** The top finding in one sentence, with tiles for the sample count, the user and kernel split, the busiest thread group, how much code has no symbols, how the samples are weighted, and where the work narrows (the deepest function that still holds at least 40%).
+2. **Findings.** One card per finding, cause first: a query stage that drives the allocator goes ahead of the allocator. Each card has an impact level (high at 30% and above, medium at 10%), a category, the call path, **Evidence** (where the time went) and **Do next** (what to change). **Show in flame graph** searches the graph for that frame. **Copy path** copies the call path.
+3. **Conclusion and action plan.** Diagnosis, an action plan with only the steps to take (tick them off as you go), and what to read with care. If symbols are missing, the plan says how to get them before anything is tuned.
+4. **Where the samples went.** Thread groups that hold at least 1% of the profile. Numbered threads (`conn1`, `conn2`, ...) are merged into one name (`conn*`), and `conn*` is shown as connections with the thread count.
+5. **Flame graph.** The same interactive SVG with a search box (press `/`), the share of the drawn graph that matches, Reset zoom, Full height, and Download SVG. The bottom row is the root. Blue is the thread, orange is the kernel, yellow is user code. Frames narrower than `--min-width` are not drawn, so the match share counts drawn frames only.
+6. **Hot functions.** Self time and inclusive time as tabs, with a filter and the call path for each row. Frames that hand almost all of their time to one child are left out of the inclusive list.
+7. **How the numbers are counted.** Width and self time, weighting, thread merging, and unnamed frames.
+
+For mongod profiles the report names the query stage that holds the work (`$lookup`, `$group`, `$sort`, COLLSCAN, IXSCAN, WiredTiger eviction) and what to check for it. For tcmalloc it says whether the per-CPU cache is in use (`CpuCache` frames) and which slow path reaches the allocator lock.
 
 Nothing on the page is fetched from the network. Send `flamegraph.html` as a single file. The SVG beside it is the same picture without the written analysis.
 

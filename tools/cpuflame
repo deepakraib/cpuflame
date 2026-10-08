@@ -75,6 +75,25 @@ function init() {
     text.style.display = w < 36 ? "none" : "";
   }
 
+  function matchedShare(q) {
+    // Width of matched frames that are not inside another match, as a share of the root.
+    if (!q) return 0;
+    var matched = {};
+    for (var i = 0; i < frames.length; i++) {
+      if (frames[i].getAttribute("data-name").toLowerCase().indexOf(q) !== -1) matched[frames[i].getAttribute("id")] = frames[i];
+    }
+    var width = 0;
+    for (var id in matched) {
+      var parts = id.split("_");
+      var nested = false;
+      for (var n = parts.length - 1; n > 1; n--) {
+        if (matched[parts.slice(0, n).join("_")]) { nested = true; break; }
+      }
+      if (!nested) width += parseFloat(matched[id].getAttribute("data-ow"));
+    }
+    return plotWidth > 0 ? Math.min(100, 100 * width / plotWidth) : 0;
+  }
+
   function applySearch() {
     var q = query.toLowerCase();
     var hits = 0;
@@ -91,12 +110,16 @@ function init() {
         box.setAttribute("fill", "#d5d5d5");
       }
     }
+    var pct = matchedShare(q);
     if (q) {
       var noun = hits === 1 ? " frame" : " frames";
-      searchLabel.textContent = "search: " + query + "  (" + hits + noun + ", Enter zooms to the first)";
+      searchLabel.textContent = "search: " + query + "  (" + hits + noun + ", " + pct.toFixed(1) + "% of the drawn graph, Enter zooms to the first)";
     } else {
       searchLabel.textContent = "Type to search. Click a frame to zoom. Esc clears.";
     }
+    try {
+      window.dispatchEvent(new CustomEvent("flamesearch", {detail: {query: query, hits: hits, pct: pct}}));
+    } catch (err) {}
   }
 
   function reset() {
@@ -168,6 +191,10 @@ function init() {
   });
 
   window.addEventListener("keydown", function(ev) {
+    var target = ev.target;
+    if (target && target.tagName && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+    if (target && target.isContentEditable) return;
+    if (window.flameKeysOff) return;
     if (ev.key === "Escape") {
       if (query) query = "";
       else reset();
@@ -202,11 +229,25 @@ function init() {
   });
 
   applySearch();
-  window.flameSearch = function(q) {
+  window.flameSearch = function(q, quiet) {
     query = q || "";
     applySearch();
+    if (quiet) return;
     var stage = document.getElementById("stage");
     if (stage && stage.scrollIntoView) stage.scrollIntoView({behavior: "smooth", block: "start"});
+  };
+  window.flameReset = function() {
+    query = "";
+    reset();
+  };
+  window.flameZoomFirst = function() {
+    var q = query.toLowerCase();
+    for (var n = 0; n < frames.length; n++) {
+      if (q && frames[n].getAttribute("data-name").toLowerCase().indexOf(q) !== -1) {
+        zoom(frames[n]);
+        return;
+      }
+    }
   };
 }
 """
@@ -1128,6 +1169,13 @@ def is_passthrough(view: View) -> bool:
     return len(view.children) == 1 and view.busy_self <= 1e-9
 
 
+def is_chain(view: View) -> bool:
+    """A frame that hands almost all of its time to one child (thread start, dispatch layers)."""
+    if view.busy <= 0:
+        return False
+    return any(child.busy >= 0.97 * view.busy for child in view.children)
+
+
 @dataclass
 class Finding:
     pct: float
@@ -1135,6 +1183,8 @@ class Finding:
     title: str
     path: str
     steps: list[str]
+    # Lower sorts first. A cause (the query stage) goes ahead of its symptom (the allocator).
+    order: int = 0
 
 
 @dataclass
@@ -1159,6 +1209,7 @@ class Report:
     unknown_unattributed: float = 0.0
     unknown_owners: tuple[tuple[str, float], ...] = ()
     unknown_modules: tuple[str, ...] = ()
+    focus: tuple[str, float, str] | None = None
 
 
 def add_finding(findings: list[Finding], finding: Finding) -> None:
@@ -1371,7 +1422,7 @@ def analyze(root: Node, top: int = 8) -> Report:
         # [unknown] merges every unnamed address in a module into one name. Its width is not one function.
         if is_unknown(name):
             continue
-        if all(is_passthrough(member) for member in members):
+        if all(is_passthrough(member) or is_chain(member) for member in members):
             continue
         inclusive = 0.0
         for member in members:
@@ -1418,10 +1469,12 @@ def analyze(root: Node, top: int = 8) -> Report:
     hottest = trim_rows(self_rows, busy, top)
     hottest_path = self_rows[0][2] if self_rows else "(none)"
 
+    focus = _work_focus(views, busy)
     findings: list[Finding] = []
     if busy > 0:
         _collect_findings(findings, views, busy, set(proc_totals), unattributed, modules)
-        findings.sort(key=lambda finding: (-finding.pct, finding.title))
+        _stage_finding(findings, views, busy)
+        findings.sort(key=lambda finding: (finding.order, -finding.pct, finding.title))
         if not findings:
             spread = _spread_finding(views, busy)
             if spread is not None:
@@ -1448,6 +1501,7 @@ def analyze(root: Node, top: int = 8) -> Report:
         unknown_unattributed=unattributed,
         unknown_owners=tuple(sorted(owners.items(), key=lambda item: (-item[1], item[0]))),
         unknown_modules=tuple(sorted(modules, key=lambda item: (-modules[item], item))),
+        focus=focus,
     )
 
 
@@ -1518,7 +1572,11 @@ def _collect_findings(
                 key=name,
                 title=f"{name} is {share(by_name[name], busy):.1f}% of self time",
                 path=path_text(hot.path),
-                steps=[f"optimize {name} first. This is where the CPU was.", *unnamed_note(name)],
+                steps=[
+                    f"optimize {name} first. This is where the CPU was. "
+                    "If it is server code you do not build, reduce the work that reaches it: the path shows the caller.",
+                    *unnamed_note(name),
+                ],
             ),
         )
         break
@@ -1626,6 +1684,153 @@ def _collect_findings(
     _deep_finding(findings, views, busy)
 
 
+SLOW_PATH_WORDS = ("Refill", "DeallocateSlow", "UpdateCapacity", "Overflow", "Underflow", "TransferCache",
+                   "CentralFreeList", "PageHeap", "PageAllocator", "RemoveRange", "InsertRange")
+
+
+def _slow_path_owners(entries: list[View]) -> list[tuple[str, float]]:
+    """Named allocator frames above the lock spin, such as CpuCache::Refill."""
+    owners: dict[str, float] = {}
+    for entry in entries:
+        for view in iter_views(entry):
+            if view.busy_self <= 0:
+                continue
+            target = frame_after_syscall(view.path) if view.node.frame.kind == "kernel" else None
+            futex_call = bool(target) and strip_symbol(target).lstrip("_").startswith(("do_futex", "futex"))
+            if not (is_lock(view.node.frame.name) or futex_call):
+                continue
+            node = view.parent
+            while node is not None and node.depth > 0:
+                name = node.node.frame.name
+                if any(word in name for word in SLOW_PATH_WORDS):
+                    short = re.sub(r"<.*>", "<…>", name)
+                    owners[short] = owners.get(short, 0.0) + view.busy_self
+                    break
+                node = node.parent
+    return sorted(owners.items(), key=lambda item: (-item[1], item[0]))
+
+
+FOCUS_SHARE = 0.40
+STAGE_SHARE = 0.20
+# MongoDB query engine frames and what a DBA calls them. Matched as substrings of the symbol.
+MONGO_STAGES = (
+    ("DocumentSourceLookUp::", "the $lookup stage"),
+    ("DocumentSourceGroup::", "the $group stage"),
+    ("DocumentSourceSort::", "the $sort stage"),
+    ("mongo::SortStage::", "an in-memory sort (SORT)"),
+    ("mongo::CollectionScan::", "collection scans (COLLSCAN)"),
+    ("mongo::IndexScan::", "index scans (IXSCAN)"),
+    ("__wt_evict", "WiredTiger cache eviction"),
+)
+
+
+def _first_visits(views: list[View], pred) -> dict[str, list[View]]:
+    found: dict[str, list[View]] = {}
+    for view in views:
+        if view.depth == 0 or view.busy <= 0 or view.node.frame.kind != "user":
+            continue
+        name = view.node.frame.name
+        if not pred(name) or ancestor_has_frame(view, name, "user"):
+            continue
+        found.setdefault(name, []).append(view)
+    return found
+
+
+def _work_focus(views: list[View], busy: float) -> tuple[str, float, str] | None:
+    """The deepest named function that still holds a large share: where the work narrows."""
+    if busy <= 0:
+        return None
+
+    def usable(name: str) -> bool:
+        return not (is_unknown(name) or is_alloc(name) or is_interpreter(name) or name in TRUNK)
+
+    best: tuple[int, float, str, View] | None = None
+    for name, members in _first_visits(views, usable).items():
+        inclusive = sum(member.busy for member in members)
+        if inclusive < FOCUS_SHARE * busy:
+            continue
+        depth = min(member.depth for member in members)
+        top = max(members, key=lambda member: member.busy)
+        key = (depth, inclusive, name, top)
+        if best is None or (depth, inclusive) > (best[0], best[1]):
+            best = key
+    if best is None:
+        return None
+    return best[2], best[1], path_text(best[3].path)
+
+
+def _alloc_under(members: list[View]) -> float:
+    total = 0.0
+    for member in members:
+        total += sum(entry.busy for entry in category_entries(list(iter_views(member)), is_alloc))
+    return total
+
+
+def _stage_finding(findings: list[Finding], views: list[View], busy: float) -> None:
+    """Name the MongoDB query stage that holds the work, when the profile is from mongod."""
+    if not any(view.node.frame.name.startswith(("mongo::", "__wt_")) for view in views):
+        return
+    best: tuple[float, str, str, list[View]] | None = None
+    for needle, label in MONGO_STAGES:
+        groups = _first_visits(views, lambda name, needle=needle: needle in name)
+        members = [member for group in groups.values() for member in group]
+        # Count each sample once even when several frames of the stage are on its stack.
+        members = [member for member in members if not any(needle in name for name in member.path[:-1])]
+        inclusive = sum(member.busy for member in members)
+        if inclusive >= STAGE_SHARE * busy and (best is None or inclusive > best[0]):
+            best = (inclusive, needle, label, members)
+    if best is None:
+        return
+    inclusive, needle, label, members = best
+    top = max(members, key=lambda member: member.busy)
+    steps: list[str] = []
+    alloc = _alloc_under(members)
+    alloc_total = sum(entry.busy for entry in category_entries(views, is_alloc))
+    cause = False
+    if alloc >= 0.05 * busy:
+        part = share(alloc, alloc_total)
+        steps.append(
+            f"{share(alloc, busy):.1f}% of the profile is memory allocation inside {label}: "
+            f"{part:.0f}% of all allocator time."
+        )
+        cause = part >= 50
+    if needle == "DocumentSourceLookUp::":
+        build = _first_visits(views, lambda name: "DocumentSourceLookUp::buildPipeline" in name)
+        build_time = sum(member.busy for group in build.values() for member in group)
+        if build_time >= 0.5 * inclusive:
+            steps.append(
+                f"{share(build_time, busy):.1f}% is building the inner pipeline (DocumentSourceLookUp::buildPipeline: "
+                "parse, optimize and plan), more than running it. $lookup runs its inner pipeline for every "
+                "document that reaches it, so this cost grows with the number of input documents."
+            )
+        steps.append(
+            "find the aggregation with $lookup (slow query log, db.currentOp(), or the profiler). "
+            "Put a $match before $lookup to send fewer documents into it, and check the foreign collection "
+            "has an index on the joined field (explain the inner query)."
+        )
+    elif needle == "mongo::CollectionScan::":
+        steps.append("find the queries with COLLSCAN in explain() or the slow query log, and add an index that fits them.")
+    elif needle in ("DocumentSourceSort::", "mongo::SortStage::"):
+        steps.append("an index that matches the sort removes the in-memory sort. Check explain() for a SORT stage.")
+    elif needle == "DocumentSourceGroup::":
+        steps.append("filter with $match and trim fields with $project before $group to feed it fewer, smaller documents.")
+    elif needle == "mongo::IndexScan::":
+        steps.append("compare keysExamined with nReturned in explain(). A large gap means the index is not selective for these queries.")
+    elif needle == "__wt_evict":
+        steps.append("check WiredTiger cache pressure: db.serverStatus().wiredTiger.cache dirty and used bytes against the eviction targets.")
+    add_finding(
+        findings,
+        Finding(
+            pct=share(inclusive, busy),
+            key=f"stage:{needle}",
+            title=f"{label} is {share(inclusive, busy):.1f}% of inclusive time",
+            path=path_text(top.path),
+            steps=steps,
+            order=-1 if cause else 0,
+        ),
+    )
+
+
 def allocator_family(names) -> str:
     joined = " ".join(names)
     if "tcmalloc" in joined:
@@ -1670,7 +1875,9 @@ def _allocator_finding(findings: list[Finding], views: list[View], busy: float) 
             names.add(view.node.frame.name)
             if view.busy_self <= 0:
                 continue
-            if is_lock(view.node.frame.name):
+            target = frame_after_syscall(view.path) if view.node.frame.kind == "kernel" else None
+            futex_call = bool(target) and strip_symbol(target).lstrip("_").startswith(("do_futex", "futex"))
+            if is_lock(view.node.frame.name) or futex_call:
                 spin += view.busy_self
                 if view.node.frame.kind == "kernel":
                     kernel_lock += view.busy_self
@@ -1706,11 +1913,23 @@ def _allocator_finding(findings: list[Finding], views: list[View], busy: float) 
         if user_spin > 0:
             parts.append(f"{share(user_spin, busy):.1f}% spinning in {short_symbol(spin_name, 80)}")
         if kernel_lock > 0:
-            parts.append(f"{share(kernel_lock, busy):.1f}% in the kernel futex and spinlock path behind it")
+            parts.append(f"{share(kernel_lock, busy):.1f}% in the futex calls and kernel spinlocks behind it")
         steps.append(
             f"{share(spin, busy):.1f}% is lock contention inside {family}: {', '.join(parts)}. "
-            "Threads are fighting over the allocator's shared free lists, not over application data."
+            "The lock belongs to the allocator, not to application data."
         )
+        slow = _slow_path_owners(entries)
+        if slow:
+            listed = ", ".join(f"{short_symbol(name, 70)} ({share(value, busy):.1f}%)" for name, value in slow[:3])
+            per_cpu = any("cpu_cache" in name.lower() or "CpuCache" in name for name, _value in slow)
+            if per_cpu:
+                steps.append(
+                    f"the lock is reached from the per-CPU cache slow path: {listed}. "
+                    "A thread goes there when its CPU's cache is empty (Refill) or full (Deallocate slow path), "
+                    "or when the cache is resized (UpdateCapacity). The shared caches behind it are locked."
+                )
+            else:
+                steps.append(f"the lock is reached from: {listed}.")
     if kernel >= 0.02 * busy:
         areas = sorted(kernel_by.items(), key=lambda item: (-item[1], item[0]))[:3]
         listed = ", ".join(f"{name} ({share(value, busy):.1f}%)" for name, value in areas)
@@ -1727,14 +1946,24 @@ def _allocator_finding(findings: list[Finding], views: list[View], busy: float) 
     else:
         steps.append(f"cut the allocation rate in the callers: {caller_text}.")
     if family == "tcmalloc":
+        per_cpu = any("cpu_cache" in name or "CpuCache" in name for name in names)
+        per_thread = any("ThreadCache" in name for name in names)
         if any(view.node.frame.name.startswith(("mongo::", "__wt_")) for view in views):
-            steps.append(
-                "mongod uses tcmalloc. Compare db.serverStatus().tcmalloc between two samples: "
-                "per-CPU cache size, central free list and page heap activity. "
-                "Growth in the central or transfer caches matches lock spinning here."
-            )
+            if per_thread and not per_cpu:
+                steps.append(
+                    "for mongod 8.0 and later: the stacks show tcmalloc's per-thread cache, not the per-CPU cache. "
+                    "Check db.serverStatus().tcmalloc.usingPerCPUCaches. If it is false, start mongod with "
+                    "GLIBC_TUNABLES=glibc.pthread.rseq=0 on a 4.18 or newer kernel, as the MongoDB tcmalloc "
+                    "performance page describes."
+                )
+            else:
+                steps.append(
+                    "for mongod: the per-CPU cache is in use (CpuCache frames). Take db.serverStatus().tcmalloc "
+                    "twice, a minute apart, during the load, and compare the per-CPU, transfer cache and central "
+                    "free list figures. Shared-cache activity that grows with load matches the lock time here."
+                )
         else:
-            steps.append("check the tcmalloc stats for per-CPU cache and central free list activity.")
+            steps.append("compare the tcmalloc statistics during the load: per-CPU cache, transfer cache and central free list.")
     add_finding(
         findings,
         Finding(
@@ -1766,7 +1995,7 @@ def _kernel_finding(findings: list[Finding], views: list[View], busy: float) -> 
                         title=f"perf overhead is {share(overhead, busy):.1f}% of self time",
                         path=path_text(hot.path),
                         steps=[
-                            f"{hot.node.frame.name} is perf turning the counter back on during a context switch. "
+                            f"this is perf turning its counter back on during a context switch ({hot.node.frame.name}). "
                             "That time is not spent in the application."
                         ],
                     ),
@@ -1800,7 +2029,7 @@ def _kernel_finding(findings: list[Finding], views: list[View], busy: float) -> 
                 title=f"kernel time is {share(kern_self, busy):.1f}% of self time",
                 path=path_text(hot.path),
                 steps=[
-                    f"{hot.node.frame.name} is perf turning the counter back on during a context switch. "
+                    f"this is perf turning its counter back on during a context switch ({hot.node.frame.name}). "
                     "That time is not spent in the application."
                 ],
             ),
@@ -2004,6 +2233,12 @@ def render_report(report: Report) -> str:
     lines.append("")
     lines.append("Hottest path")
     lines.append(f"  {report.hottest_path}")
+    if report.focus is not None:
+        name, samples, path = report.focus
+        lines.append("")
+        lines.append("Where the work narrows")
+        lines.append(f"  {share(samples, report.busy):5.1f}%  {short_symbol(name, 120)}")
+        lines.append(f"  {path}")
     lines.append("")
     lines.append("Findings")
     if not report.findings:
@@ -2036,6 +2271,26 @@ def _unknown_module(name: str) -> str:
     if not name.startswith("[unknown]"):
         return ""
     return name[len("[unknown]"):].strip()
+
+
+ACTION_STARTS = (
+    "cut ", "find ", "check ", "compare ", "optimize ", "install ", "run ", "record ", "re-record", "put ",
+    "take ", "reduce ", "filter ", "shorten ", "bound ", "use ", "for mongod", "an index", "jit code",
+    "this is the python", "this is recursion", "the cpu is spinning", "or run", "do not tune",
+)
+
+
+def is_action(step: str) -> bool:
+    """A step that says what to do, as opposed to evidence about where the time went."""
+    return step.strip().lower().startswith(ACTION_STARTS)
+
+
+def sentence_case(text: str) -> str:
+    """Capitalize a plain English first word. Leave code names such as mongod or __wt_x alone."""
+    first = text.split(" ", 1)[0]
+    if first.isalpha() and first.islower() and first not in {"mongod", "mysqld", "postgres", "perf", "tcmalloc", "jemalloc"}:
+        return text[:1].upper() + text[1:]
+    return text
 
 
 def profile_notes(report: Report) -> list[str]:
@@ -2086,6 +2341,10 @@ def conclusion_points(report: Report) -> tuple[list[str], list[str], list[str]]:
             "A perf.script file copied alone often keeps addresses and loses every symbol."
         )
         fix.append(
+            "Or run perf archive perf.data on the server and send perf.data.tar.bz2 with perf.data. "
+            "On the analysis machine, extract it into ~/.debug (tar xf perf.data.tar.bz2 -C ~/.debug) before perf script."
+        )
+        fix.append(
             "Install debug symbols for the server binary and for glibc, or repeat the capture with a build that is not stripped."
         )
         fix.append(
@@ -2122,12 +2381,15 @@ def conclusion_points(report: Report) -> tuple[list[str], list[str], list[str]]:
     for finding in report.findings:
         if finding is unknown_finding:
             continue
-        wrong.append(finding.title + ".")
+        wrong.append(sentence_case(finding.title) + ".")
         for step in finding.steps:
-            sentence = step[:1].upper() + step[1:]
+            if not is_action(step):
+                continue
+            sentence = sentence_case(step)
             if not sentence.endswith("."):
                 sentence += "."
-            fix.append(sentence)
+            if sentence not in fix:
+                fix.append(sentence)
 
     if not wrong:
         wrong.append("No single function crossed the hotspot line.")
@@ -2137,243 +2399,734 @@ def conclusion_points(report: Report) -> tuple[list[str], list[str], list[str]]:
     return wrong, fix, unusual
 
 
+PAGE_CSS = r"""
+:root {
+  color-scheme: light;
+  --page: #f4f3ef;
+  --surface: #fcfcfb;
+  --surface-2: #f0efea;
+  --line: #e2e0d8;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --ink-3: #75736c;
+  --accent: #2a78d6;
+  --accent-soft: #cde2fb;
+  --user: #e0a040;
+  --kernel: #d06a28;
+  --critical: #d03b3b;
+  --serious: #ec835a;
+  --warning: #fab219;
+  --good: #0ca30c;
+  --track: #ebe9e2;
+  --graph-bg: #f6f6f4;
+  --code-bg: #f0efea;
+  --shadow: 0 1px 2px rgba(20, 20, 10, 0.05), 0 4px 16px rgba(20, 20, 10, 0.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #121211;
+    --surface: #1a1a19;
+    --surface-2: #232321;
+    --line: #34332f;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --ink-3: #9c9a90;
+    --accent: #3987e5;
+    --accent-soft: #184f95;
+    --track: #2b2b28;
+    --graph-bg: #1f1f1d;
+    --code-bg: #262624;
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #121211;
+  --surface: #1a1a19;
+  --surface-2: #232321;
+  --line: #34332f;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --ink-3: #9c9a90;
+  --accent: #3987e5;
+  --accent-soft: #184f95;
+  --track: #2b2b28;
+  --graph-bg: #1f1f1d;
+  --code-bg: #262624;
+  --shadow: none;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 72px; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+code, .mono { font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", Menlo, Consolas, monospace; font-size: 12.5px; }
+a { color: var(--accent); }
+.wrap { width: min(1240px, calc(100% - 32px)); margin: 0 auto; }
+
+/* top bar */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  background: color-mix(in srgb, var(--page) 88%, transparent);
+  backdrop-filter: saturate(1.4) blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+.topbar .wrap { display: flex; align-items: center; gap: 18px; min-height: 56px; }
+.brand { font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; }
+.brand small { color: var(--ink-3); font-weight: 500; margin-left: 6px; }
+.nav { display: flex; gap: 2px; overflow-x: auto; flex: 1; scrollbar-width: none; }
+.nav a {
+  color: var(--ink-2); text-decoration: none; padding: 6px 10px; border-radius: 6px;
+  font-size: 13.5px; white-space: nowrap;
+}
+.nav a:hover, .nav a.on { background: var(--surface-2); color: var(--ink); }
+.tools { display: flex; gap: 6px; }
+.btn {
+  appearance: none; border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+  border-radius: 7px; padding: 6px 11px; font: 500 13px/1.2 inherit; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.btn:hover { border-color: var(--ink-3); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn:focus-visible, .nav a:focus-visible, input:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* hero */
+.hero { padding: 34px 0 10px; }
+.eyebrow { color: var(--ink-3); font-size: 12.5px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 600; margin: 0 0 10px; }
+.verdict { display: flex; gap: 14px; align-items: flex-start; }
+.verdict h1 { font-size: clamp(24px, 3.2vw, 34px); line-height: 1.2; letter-spacing: -0.02em; margin: 0; font-weight: 650; }
+.lede { color: var(--ink-2); max-width: 900px; margin: 12px 0 0; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 10px 3px 8px;
+  font-size: 12px; font-weight: 600; white-space: nowrap; border: 1px solid var(--line); background: var(--surface);
+  color: var(--ink);
+}
+.chip .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.sev-critical .dot { background: var(--critical); }
+.sev-serious .dot { background: var(--serious); }
+.sev-warning .dot { background: var(--warning); }
+.sev-good .dot { background: var(--good); }
+.chip.cat { color: var(--ink-2); font-weight: 500; }
+
+/* tiles */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 22px 0 6px; }
+.tile {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  box-shadow: var(--shadow); min-width: 0;
+}
+.tile .label { color: var(--ink-2); font-size: 13px; }
+.tile .value { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; margin-top: 2px; }
+.tile .sub { color: var(--ink-3); font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
+.tile.wide { grid-column: span 2; }
+.split { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 10px 0 6px; gap: 2px; background: var(--surface); }
+.split span { display: block; height: 100%; }
+.split .u { background: var(--user); border-radius: 4px 0 0 4px; }
+.split .k { background: var(--kernel); border-radius: 0 4px 4px 0; }
+.split-legend { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink-2); }
+.key { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+
+/* sections */
+section { margin: 34px 0; }
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+h2 { font-size: 20px; letter-spacing: -0.01em; margin: 0; font-weight: 650; }
+.hint { color: var(--ink-3); font-size: 13px; margin: 0; }
+
+/* findings */
+.findings { display: grid; gap: 12px; }
+.finding {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);
+  border-left: 4px solid var(--line); overflow: hidden;
+}
+.finding.sev-critical { border-left-color: var(--critical); }
+.finding.sev-serious { border-left-color: var(--serious); }
+.finding.sev-warning { border-left-color: var(--warning); }
+.finding-head { display: grid; grid-template-columns: 34px minmax(0, 1fr) 150px; gap: 14px; padding: 16px 18px 8px; align-items: start; }
+.rank {
+  width: 30px; height: 30px; border-radius: 50%; background: var(--surface-2); color: var(--ink);
+  display: grid; place-items: center; font-weight: 650; font-size: 13px;
+}
+.finding h3 { margin: 0 0 6px; font-size: 17px; line-height: 1.35; overflow-wrap: anywhere; }
+.meta { display: flex; gap: 6px; flex-wrap: wrap; }
+.share { text-align: right; }
+.share .num { font-size: 24px; font-weight: 650; letter-spacing: -0.02em; }
+.share .of { color: var(--ink-3); font-size: 12px; }
+.meter { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; margin-top: 6px; }
+.meter span { display: block; height: 100%; border-radius: 3px; }
+.sev-critical .meter span { background: var(--critical); }
+.sev-serious .meter span { background: var(--serious); }
+.sev-warning .meter span { background: var(--warning); }
+.finding-body { padding: 0 18px 16px 66px; }
+.steps { margin: 2px 0 12px; padding-left: 18px; }
+.finding-body h4 { margin: 10px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); }
+.steps li { margin: 4px 0; overflow-wrap: anywhere; }
+.steps li::marker { color: var(--ink-3); }
+.path {
+  display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 8px 0 10px;
+  background: var(--code-bg); border-radius: 8px; padding: 8px 10px;
+}
+.path code { background: var(--surface); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; max-width: 100%; overflow-wrap: anywhere; }
+.path .sep { color: var(--ink-3); font-size: 12px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* conclusion */
+.plan { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr); gap: 12px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; box-shadow: var(--shadow); min-width: 0; }
+.panel h3 { margin: 0 0 10px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+.panel ul, .panel ol { margin: 0; padding-left: 18px; }
+.panel li { margin: 0 0 9px; overflow-wrap: anywhere; }
+.todo { list-style: none; padding-left: 0 !important; counter-reset: step; }
+.todo li { display: grid; grid-template-columns: 22px 1fr; gap: 8px; align-items: start; }
+.todo input { margin-top: 4px; accent-color: var(--accent); }
+.todo input:checked + span { color: var(--ink-3); text-decoration: line-through; }
+
+/* threads */
+.bars { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 12px 16px; box-shadow: var(--shadow); }
+.bar { display: grid; grid-template-columns: minmax(120px, 260px) minmax(0, 1fr) 58px; gap: 12px; align-items: center; padding: 5px 0; }
+.bar .name { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar .track { height: 10px; border-radius: 5px; background: var(--track); overflow: hidden; }
+.bar .fill { display: block; height: 100%; background: var(--accent); border-radius: 0 4px 4px 0; }
+.bar .pct { text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; color: var(--ink-2); }
+
+/* graph */
+.graph-card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
+.toolbar { display: flex; gap: 8px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.search { position: relative; flex: 1 1 260px; min-width: 200px; }
+.search input, .filter {
+  width: 100%; border: 1px solid var(--line); background: var(--page); color: var(--ink);
+  border-radius: 8px; padding: 7px 10px 7px 30px; font: 13.5px/1.2 inherit;
+}
+.search svg { background: none !important; position: absolute; left: 9px; top: 50%; transform: translateY(-50%); color: var(--ink-3); }
+.matches { font-size: 12.5px; color: var(--ink-2); min-width: 150px; font-variant-numeric: tabular-nums; }
+.legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--ink-2); padding: 0 4px; }
+#stage { overflow: auto; max-height: 72vh; background: var(--graph-bg); }
+#stage.tall { max-height: none; }
+#stage svg { display: block; background: var(--graph-bg) !important; }
+#stage #bg { fill: var(--graph-bg); }
+#stage text.title, #stage #details, #stage #searchlabel { fill: var(--ink-2); }
+#stage #unzoom { fill: var(--accent); }
+
+/* tables */
+.tabs { display: inline-flex; background: var(--surface-2); border-radius: 9px; padding: 3px; gap: 2px; }
+.tabs button {
+  border: 0; background: transparent; color: var(--ink-2); padding: 6px 12px; border-radius: 7px; cursor: pointer;
+  font: 500 13px/1.2 inherit;
+}
+.tabs button[aria-selected="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }
+.table-card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
+.table-tools { display: flex; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); align-items: center; flex-wrap: wrap; }
+.table-tools .filter { max-width: 340px; padding-left: 10px; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 12px; color: var(--ink-3); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+th.num, td.num { width: 120px; text-align: right; font-variant-numeric: tabular-nums; }
+td .fn { overflow-wrap: anywhere; font-weight: 550; }
+td details summary { cursor: pointer; color: var(--ink-3); font-size: 12.5px; margin-top: 3px; }
+td details code { display: block; margin-top: 4px; color: var(--ink-2); overflow-wrap: anywhere; }
+td .inline-meter { height: 4px; background: var(--track); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+td .inline-meter span { display: block; height: 100%; background: var(--accent); }
+tr:hover td { background: var(--surface-2); }
+.hidden { display: none !important; }
+
+/* method */
+.method { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.method .panel p { margin: 0; color: var(--ink-2); font-size: 14px; }
+footer { color: var(--ink-3); font-size: 12.5px; padding: 24px 0 48px; border-top: 1px solid var(--line); margin-top: 40px; }
+
+.toast {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%) translateY(20px); opacity: 0;
+  background: var(--ink); color: var(--page); padding: 8px 14px; border-radius: 8px; font-size: 13px;
+  transition: all 0.2s ease; pointer-events: none; z-index: 50;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+@media (max-width: 900px) {
+  .plan { grid-template-columns: 1fr; }
+  .finding-head { grid-template-columns: 30px minmax(0, 1fr); }
+  .share { grid-column: 2; text-align: left; }
+  .finding-body { padding-left: 18px; }
+  .tile.wide { grid-column: auto; }
+  .nav { display: none; }
+}
+@media (max-width: 560px) {
+  .bar { grid-template-columns: minmax(0, 1fr) 58px; }
+  .bar .track { grid-column: 1 / -1; grid-row: 2; }
+}
+@media print {
+  .topbar, .toolbar, .actions, .table-tools, .tools { display: none !important; }
+  body { background: #fff; }
+  .finding, .panel, .tile, .bars, .graph-card, .table-card { box-shadow: none; break-inside: avoid; }
+  #stage { max-height: none; overflow: visible; }
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .toast { transition: none; } }
+"""
+
+PAGE_JS = r"""
+(function () {
+  var root = document.documentElement;
+  function store(key, value) { try { if (value === undefined) return localStorage.getItem(key); localStorage.setItem(key, value); } catch (e) { return null; } }
+  var theme = store("cpuflame-theme");
+  if (theme === "light" || theme === "dark") root.setAttribute("data-theme", theme);
+  var themeBtn = document.getElementById("theme");
+  function themeLabel() {
+    var t = root.getAttribute("data-theme");
+    themeBtn.textContent = t === "dark" ? "Light" : t === "light" ? "Dark" : (matchMedia("(prefers-color-scheme: dark)").matches ? "Light" : "Dark");
+  }
+  if (themeBtn) {
+    themeLabel();
+    themeBtn.addEventListener("click", function () {
+      var dark = root.getAttribute("data-theme") === "dark" ||
+        (!root.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
+      var next = dark ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      store("cpuflame-theme", next);
+      themeLabel();
+    });
+  }
+  var printBtn = document.getElementById("print");
+  if (printBtn) printBtn.addEventListener("click", function () { window.print(); });
+
+  var toast = document.getElementById("toast");
+  function say(text) {
+    if (!toast) return;
+    toast.textContent = text;
+    toast.classList.add("show");
+    clearTimeout(say.t);
+    say.t = setTimeout(function () { toast.classList.remove("show"); }, 1600);
+  }
+  function copy(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { say("Copied"); }, function () { fallback(text); });
+    } else { fallback(text); }
+  }
+  function fallback(text) {
+    var area = document.createElement("textarea");
+    area.value = text; document.body.appendChild(area); area.select();
+    try { document.execCommand("copy"); say("Copied"); } catch (e) { say("Copy failed"); }
+    document.body.removeChild(area);
+  }
+  document.querySelectorAll("[data-copy]").forEach(function (btn) {
+    btn.addEventListener("click", function () { copy(btn.getAttribute("data-copy")); });
+  });
+
+  // Graph toolbar.
+  var input = document.getElementById("flame-q");
+  var matches = document.getElementById("matches");
+  var stage = document.getElementById("stage");
+  function goGraph() {
+    var section = document.getElementById("graph");
+    if (section) section.scrollIntoView({behavior: "smooth", block: "start"});
+  }
+  window.addEventListener("flamesearch", function (ev) {
+    var d = ev.detail || {};
+    if (input && document.activeElement !== input) input.value = d.query || "";
+    if (!matches) return;
+    matches.textContent = d.query ? (d.hits + (d.hits === 1 ? " frame, " : " frames, ") + d.pct.toFixed(1) + "% of the drawn graph") : "";
+  });
+  if (input) {
+    input.addEventListener("input", function () { if (window.flameSearch) window.flameSearch(input.value, true); });
+    input.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && window.flameZoomFirst) { window.flameZoomFirst(); ev.preventDefault(); }
+      if (ev.key === "Escape") { input.value = ""; if (window.flameSearch) window.flameSearch("", true); input.blur(); }
+    });
+  }
+  window.addEventListener("keydown", function (ev) {
+    var t = ev.target;
+    if (ev.key === "/" && !(t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) {
+      if (input) { goGraph(); input.focus(); ev.preventDefault(); }
+    }
+  });
+  var resetBtn = document.getElementById("reset");
+  if (resetBtn) resetBtn.addEventListener("click", function () {
+    if (input) input.value = "";
+    if (window.flameReset) window.flameReset();
+    if (window.flameSearch) window.flameSearch("", true);
+  });
+  var tallBtn = document.getElementById("tall");
+  if (tallBtn && stage) tallBtn.addEventListener("click", function () {
+    stage.classList.toggle("tall");
+    tallBtn.textContent = stage.classList.contains("tall") ? "Fit height" : "Full height";
+  });
+  var dl = document.getElementById("download");
+  if (dl && stage) dl.addEventListener("click", function () {
+    var svg = stage.querySelector("svg");
+    if (!svg) return;
+    var text = '<?xml version="1.0" encoding="UTF-8"?>\n' + svg.outerHTML;
+    var url = URL.createObjectURL(new Blob([text], {type: "image/svg+xml"}));
+    var a = document.createElement("a");
+    a.href = url; a.download = "flamegraph.svg"; document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 500);
+  });
+  document.querySelectorAll("[data-highlight]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var q = btn.getAttribute("data-highlight");
+      if (input) input.value = q;
+      if (window.flameSearch) window.flameSearch(q, true);
+      goGraph();
+    });
+  });
+
+  // Start the graph at its root, which is the bottom row.
+  if (stage && stage.getAttribute("data-icicle") !== "1") stage.scrollTop = stage.scrollHeight;
+
+  // Table tabs and filter.
+  var tabs = document.querySelectorAll(".tabs button");
+  tabs.forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      tabs.forEach(function (other) {
+        var on = other === tab;
+        other.setAttribute("aria-selected", on ? "true" : "false");
+        document.getElementById(other.getAttribute("aria-controls")).classList.toggle("hidden", !on);
+      });
+    });
+  });
+  var filter = document.getElementById("filter");
+  if (filter) filter.addEventListener("input", function () {
+    var q = filter.value.toLowerCase();
+    document.querySelectorAll("tbody tr[data-name]").forEach(function (row) {
+      row.classList.toggle("hidden", q && row.getAttribute("data-name").toLowerCase().indexOf(q) === -1);
+    });
+  });
+
+  // Highlight the section in view.
+  var links = Array.prototype.slice.call(document.querySelectorAll(".nav a"));
+  if ("IntersectionObserver" in window) {
+    var seen = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        links.forEach(function (link) { link.classList.toggle("on", link.getAttribute("href") === "#" + entry.target.id); });
+      });
+    }, {rootMargin: "-40% 0px -55% 0px"});
+    links.forEach(function (link) {
+      var target = document.querySelector(link.getAttribute("href"));
+      if (target) seen.observe(target);
+    });
+  }
+})();
+"""
+
+SEVERITY_LABELS = {"critical": "High impact", "serious": "Medium impact", "warning": "Low impact"}
+
+
+def finding_category(finding: Finding) -> str:
+    key = finding.key
+    if key.startswith("stage:"):
+        return "Query stage"
+    if key.startswith("alloc:") or "allocation" in finding.title or any("allocation rate" in step for step in finding.steps):
+        return "Allocator"
+    if finding.title.startswith("[unknown]"):
+        return "Missing symbols"
+    if key.startswith("kernel:") or finding.title.startswith("perf overhead"):
+        return "Kernel"
+    if key.startswith("deep:"):
+        return "Recursion"
+    if key.startswith("spread:"):
+        return "No single hotspot"
+    if any("spinning in" in step for step in finding.steps):
+        return "Lock spin"
+    if any("cut copies" in step for step in finding.steps):
+        return "Memory copies"
+    if any("touching new memory" in step for step in finding.steps):
+        return "Page faults"
+    if any("eval loop" in step for step in finding.steps):
+        return "Interpreter"
+    if any(step.startswith("the cost is in this") for step in finding.steps):
+        return "Library"
+    return "CPU hotspot"
+
+
+def finding_severity(finding: Finding) -> str:
+    if finding.title.startswith("[unknown]"):
+        return "critical"
+    if finding.pct >= 30:
+        return "critical"
+    if finding.pct >= 10:
+        return "serious"
+    return "warning"
+
+
+def _path_chips(path: str) -> str:
+    parts = [part for part in path.split(" → ") if part]
+    chips = []
+    for index, part in enumerate(parts):
+        if index:
+            chips.append('<span class="sep" aria-hidden="true">›</span>')
+        if part == "…":
+            chips.append('<span class="sep" title="frames left out">…</span>')
+        else:
+            chips.append(f"<code>{escape(part)}</code>")
+    return "".join(chips)
+
+
+def _highlight_term(finding: Finding) -> str:
+    parts = [part for part in finding.path.split(" → ") if part and part != "…"]
+    raw = parts[-1] if parts else finding.title.split(" is ", 1)[0]
+    if raw.startswith("[unknown] "):
+        return raw
+    return re.sub(r"\(.*$", "", raw)[:120] or raw
+
+
 def render_html(report: Report, svg_markup: str, icicle: bool = False) -> str:
     busy = report.busy if report.busy > 0 else report.total
-    user_pct = share(report.user_self, busy) if busy else 0
-    kern_pct = share(report.kernel_self, busy) if busy else 0
-    if report.findings:
-        verdict = report.findings[0].title
-    else:
-        verdict = "No single CPU problem stands out in this profile."
-
-    def pct_bar(pct: float, color: str) -> str:
-        width = max(0.0, min(100.0, pct))
-        return (
-            f'<div class="track"><span class="fill" style="width:{width:.1f}%;background:{color}"></span></div>'
-        )
-
-    finding_cards = []
-    if not report.findings:
-        finding_cards.append(
-            '<article class="card quiet"><h3>No single CPU problem</h3>'
-            "<p>Nothing in this profile crossed the hotspot lines. "
-            "Start with the widest frames in the graph.</p></article>"
-        )
-    for index, finding in enumerate(report.findings, start=1):
-        steps = "".join(f"<p>{escape(step)}</p>" for step in finding.steps)
-        raw = finding.path.split(" → ")[-1]
-        if raw == "…":
-            raw = finding.title.split(" is ", 1)[0]
-        call = "flameSearch('" + raw.replace("\\", "\\\\").replace("'", "\\'") + "')"
-        finding_cards.append(
-            "<article class=\"card\">"
-            f'<div class="rank">{index}</div>'
-            f"<h3>{escape(finding.title)}</h3>"
-            f'<p class="path">{escape(finding.path)}</p>'
-            f"{steps}"
-            f'<button type="button" onclick="{escape(call, quote=True)}">Highlight in the graph</button>'
-            "</article>"
-        )
-
-    thread_rows = []
-    if report.no_comm:
-        thread_rows.append("<p>Process names were not recorded.</p>")
-    else:
-        for name, samples in report.processes:
-            pct = share(samples, busy) if busy else 0
-            thread_rows.append(
-                '<div class="thread">'
-                f'<div class="thread-name">{escape(name)}</div>'
-                f"{pct_bar(pct, '#2f6f9f')}"
-                f'<div class="thread-pct">{pct:.1f}%</div>'
-                "</div>"
-            )
-
-    def table_rows(rows: list[tuple[float, str, str]]) -> str:
-        body = []
-        for samples, name, path in rows:
-            pct = share(samples, busy) if busy else 0
-            body.append(
-                "<tr>"
-                f"<td>{pct:.1f}%</td>"
-                f"<td>{escape(short_symbol(name, 96))}</td>"
-                f"<td>{escape(path)}</td>"
-                "</tr>"
-            )
-        return "\n".join(body) or "<tr><td colspan=\"3\">None</td></tr>"
-
+    user_pct = share(report.user_self, busy) if busy else 0.0
+    kern_pct = share(report.kernel_self, busy) if busy else 0.0
+    count = report.sample_count or report.total
     wrong, fix, unusual = conclusion_points(report)
 
-    def bullet_list(items: list[str], ordered: bool) -> str:
-        tag = "ol" if ordered else "ul"
-        body = "".join(f"<li>{escape(item)}</li>" for item in items)
-        return f"<{tag}>{body}</{tag}>"
+    if report.findings:
+        top = report.findings[0]
+        verdict = sentence_case(top.title) + "."
+        if top.title.startswith("[unknown]"):
+            verdict = (
+                f"This capture cannot be used for tuning yet: {top.pct:.1f}% of on-CPU time has no function names."
+            )
+        top_sev = finding_severity(top)
+    else:
+        verdict = "No single CPU problem stands out in this profile."
+        top_sev = "good"
+    sev_label = SEVERITY_LABELS.get(top_sev, "No hotspot")
 
-    conclusion = (
-        "<section><h2>Conclusion</h2><div class=\"conclusion\">"
-        f"<div><h3>What is wrong</h3>{bullet_list(wrong, False)}</div>"
-        f"<div><h3>What to do</h3>{bullet_list(fix, True)}</div>"
-        f"<div><h3>Unusual</h3>{bullet_list(unusual, False)}</div>"
-        "</div></section>"
-    )
-
-    idle_note = ""
+    # Tiles.
+    if report.weight == "period":
+        weight_value = "Event count"
+        weight_sub = ", ".join(report.events) or "period on each sample"
+    elif report.weight == "folded":
+        weight_value = "Folded counts"
+        weight_sub = "as written in the input"
+    else:
+        weight_value = "Sample count"
+        weight_sub = "each sample counts as 1"
+    if report.no_comm or not report.processes:
+        busiest, busiest_pct = "Not recorded", None
+    else:
+        busiest, busiest_samples = report.processes[0]
+        busiest_pct = share(busiest_samples, busy) if busy else 0.0
+    unnamed_pct = share(report.unknown_self, busy) if busy else 0.0
+    unattributed_pct = share(report.unknown_unattributed, busy) if busy else 0.0
+    if unattributed_pct >= 10:
+        symbols_value, symbols_sub = f"{unattributed_pct:.1f}%", "of self time has no name and no named caller"
+    elif unnamed_pct >= 1:
+        symbols_value, symbols_sub = f"{unnamed_pct:.1f}%", "unnamed, counted under its named caller"
+    else:
+        symbols_value, symbols_sub = "Named", "nearly every frame has a symbol"
+    tiles = [
+        f'<div class="tile"><div class="label">{"Folded stacks" if report.weight == "folded" else "On-CPU samples"}</div>'
+        f'<div class="value">{escape(fmt_num(count))}</div>'
+        f'<div class="sub">{escape(sample_line(report))}</div></div>',
+        f'<div class="tile wide"><div class="label">Where the CPU ran</div>'
+        f'<div class="split" role="img" aria-label="user code {user_pct:.1f} percent, kernel {kern_pct:.1f} percent">'
+        f'<span class="u" style="width:{max(0.0, min(100.0, user_pct)):.2f}%"></span>'
+        f'<span class="k" style="width:{max(0.0, min(100.0, kern_pct)):.2f}%"></span></div>'
+        f'<div class="split-legend"><span><i class="key" style="background:var(--user)"></i>User code {user_pct:.1f}%</span>'
+        f'<span><i class="key" style="background:var(--kernel)"></i>Kernel {kern_pct:.1f}%</span></div></div>',
+        f'<div class="tile"><div class="label">Busiest thread group</div><div class="value">'
+        f'{"—" if busiest_pct is None else f"{busiest_pct:.1f}%"}</div><div class="sub">{escape(busiest)}</div></div>',
+        f'<div class="tile"><div class="label">Symbols</div><div class="value">{escape(symbols_value)}</div>'
+        f'<div class="sub">{escape(symbols_sub)}</div></div>',
+        f'<div class="tile"><div class="label">Weighted by</div><div class="value">{escape(weight_value)}</div>'
+        f'<div class="sub">{escape(weight_sub)}</div></div>',
+    ]
+    if report.focus is not None:
+        name, samples, _path = report.focus
+        tiles.append(
+            f'<div class="tile wide"><div class="label">Where the work narrows</div>'
+            f'<div class="value">{share(samples, busy):.1f}%</div>'
+            f'<div class="sub mono">{escape(short_symbol(name, 110))}</div></div>'
+        )
     if report.idle > 0 and report.total > 0:
-        idle_note = (
-            f"<p class=\"note\">Idle is {share(report.idle, report.total):.1f}% "
-            f"({escape(report.idle_label)}) and is left out of the percentages below.</p>"
+        tiles.append(
+            f'<div class="tile"><div class="label">Idle (left out)</div><div class="value">{share(report.idle, report.total):.1f}%</div>'
+            f'<div class="sub">{escape(report.idle_label)}</div></div>'
         )
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CPU flame report</title>
-<style>
-  :root {{
-    --ink: #1c1915;
-    --muted: #5c564c;
-    --paper: #f7f4ee;
-    --card: #fffdf8;
-    --line: #e4dccf;
-    --accent: #8c3b12;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0;
-    color: var(--ink);
-    background: var(--paper);
-    font: 16px/1.5 "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
-  }}
-  header, main {{ width: min(1180px, calc(100% - 32px)); margin: 0 auto; }}
-  header {{ padding: 36px 0 8px; }}
-  .kicker {{
-    margin: 0 0 8px;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    font: 600 12px/1.2 ui-sans-serif, "Segoe UI", sans-serif;
-    color: var(--accent);
-  }}
-  h1 {{ margin: 0 0 8px; font-size: 40px; line-height: 1.1; font-weight: 600; }}
-  h2 {{ margin: 0 0 12px; font-size: 22px; }}
-  .verdict {{ font-size: 22px; margin: 0 0 18px; }}
-  .mix {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin: 18px 0 8px; }}
-  .mix > div {{ background: var(--card); border: 1px solid var(--line); padding: 12px 14px; }}
-  .mix strong {{ display: block; font: 600 28px/1 ui-sans-serif, "Segoe UI", sans-serif; }}
-  .mix > div > span {{ display: block; margin-bottom: 6px; color: var(--muted); font: 13px/1.3 ui-sans-serif, "Segoe UI", sans-serif; }}
-  section {{ margin: 28px 0; }}
-  .cards {{ display: grid; gap: 12px; }}
-  .card, .conclusion li, .card p {{ overflow-wrap: anywhere; }}
-  .card {{
-    background: var(--card);
-    border: 1px solid var(--line);
-    padding: 16px 16px 12px 58px;
-    position: relative;
-  }}
-  .rank {{
-    position: absolute; left: 14px; top: 16px;
-    width: 28px; height: 28px; border-radius: 50%;
-    background: var(--ink); color: var(--paper);
-    font: 600 13px/28px ui-sans-serif, sans-serif; text-align: center;
-  }}
-  .card h3 {{ margin: 0 0 6px; font-size: 18px; }}
-  .path, td:last-child {{
-    font: 13px/1.4 ui-monospace, "Cascadia Code", monospace;
-    color: var(--muted); overflow-wrap: anywhere;
-  }}
-  button {{
-    margin-top: 8px;
-    background: transparent; color: var(--accent);
-    border: 1px solid var(--accent); padding: 6px 10px; cursor: pointer;
-    font: 13px/1 ui-sans-serif, sans-serif;
-  }}
-  button:hover {{ background: var(--accent); color: white; }}
-  .thread {{ display: grid; grid-template-columns: 220px minmax(0, 1fr) 52px; gap: 10px; align-items: center; margin: 6px 0; }}
-  .thread-name, .thread-pct {{ font: 13px/1.2 ui-sans-serif, sans-serif; }}
-  .track {{ height: 10px; background: #efe8dc; }}
-  .fill {{ display: block; height: 100%; }}
-  .legend {{ display: flex; gap: 16px; font: 13px/1 ui-sans-serif, sans-serif; color: var(--muted); }}
-  .swatch {{ display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; }}
-  #stage {{
-    overflow: auto; max-height: 78vh; border: 1px solid var(--line); background: #f6f6f6;
-  }}
-  table {{ width: 100%; border-collapse: collapse; background: var(--card); table-layout: fixed; }}
-  th:first-child, td:first-child {{ width: 72px; }}
-  td {{ overflow-wrap: anywhere; }}
-  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }}
-  th {{ font: 600 12px/1.2 ui-sans-serif, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }}
-  .note {{ color: var(--muted); }}
-  .conclusion {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
-  .conclusion div {{ background: var(--card); border: 1px solid var(--line); padding: 14px 16px; }}
-  .conclusion h3 {{ margin: 0 0 8px; font-size: 16px; }}
-  .conclusion ul, .conclusion ol {{ margin: 0; padding-left: 18px; }}
-  .conclusion li {{ margin: 0 0 8px; }}
-  @media (max-width: 800px) {{
-    .conclusion {{ grid-template-columns: 1fr; }}
-  }}
-  @media (max-width: 800px) {{
-    .mix, .thread {{ grid-template-columns: 1fr; }}
-    h1 {{ font-size: 32px; }}
-  }}
-</style>
-</head>
-<body>
-<header>
-  <p class="kicker">CPU flame report</p>
-  <h1>{escape(fmt_num(report.sample_count or report.total))} on-CPU samples</h1>
-  <p class="note">{escape(sample_line(report))}</p>
-  <p class="verdict">{escape(verdict)}</p>
-  <p>Each frame's width is time the CPU was in that function, including everything it called. The bottom row is the root. Start with the widest frames. Self time is the part of a frame not covered by its children. That is where the CPU actually was.</p>
-  {idle_note}
-  <div class="mix">
-    <div><strong>{user_pct:.1f}%</strong><span>user code</span>{pct_bar(user_pct, "#e0a040")}</div>
-    <div><strong>{kern_pct:.1f}%</strong><span>kernel</span>{pct_bar(kern_pct, "#d06a28")}</div>
-  </div>
-</header>
-<main>
-  <section>
-    <h2>What is wrong</h2>
-    <div class="cards">{"".join(finding_cards)}</div>
-  </section>
-  {conclusion}
-  <section>
-    <h2>Where the samples went</h2>
-    {"".join(thread_rows)}
-  </section>
-  <section>
-    <h2>The flame graph</h2>
-    <p class="legend">
-      <span><i class="swatch" style="background:#3d7eb5"></i>process</span>
-      <span><i class="swatch" style="background:#d06a28"></i>kernel</span>
-      <span><i class="swatch" style="background:#e0a040"></i>user code</span>
-    </p>
-    <p class="note">Click a frame to zoom. Type to search. Esc clears. Reset zoom is at the top of the graph.</p>
-    <div id="stage">{svg_embedded(svg_markup)}</div>
-    <script>
-      // The root is the bottom row. Start the view there, where the graph begins.
-      (function () {{
-        var stage = document.getElementById("stage");
-        if (stage && !{str(icicle).lower()}) stage.scrollTop = stage.scrollHeight;
-      }})();
-    </script>
-  </section>
-  <section>
-    <h2>Widest frames</h2>
-    <table><thead><tr><th>Share</th><th>Frame</th><th>Path</th></tr></thead><tbody>
-    {table_rows(report.widest)}
-    </tbody></table>
-  </section>
-  <section>
-    <h2>Where the CPU actually was</h2>
-    <table><thead><tr><th>Self</th><th>Frame</th><th>Path</th></tr></thead><tbody>
-    {table_rows(report.hottest)}
-    </tbody></table>
-  </section>
-</main>
-</body>
-</html>
-"""
+    # Findings.
+    cards = []
+    if not report.findings:
+        cards.append(
+            '<article class="finding"><div class="finding-head"><div class="rank">✓</div><div>'
+            "<h3>No single CPU problem</h3><p class=\"hint\">Nothing crossed the hotspot lines. "
+            "Start with the widest frames in the graph and the table below.</p></div></div></article>"
+        )
+    for index, finding in enumerate(report.findings, start=1):
+        sev = finding_severity(finding)
+        category = finding_category(finding)
+        pct = max(0.0, min(100.0, finding.pct))
+        evidence = [step for step in finding.steps if not is_action(step)]
+        actions = [step for step in finding.steps if is_action(step)]
+        steps = ""
+        if evidence:
+            steps += '<h4>Evidence</h4><ul class="steps">' + "".join(
+                f"<li>{escape(sentence_case(step))}</li>" for step in evidence
+            ) + "</ul>"
+        if actions:
+            steps += '<h4>Do next</h4><ol class="steps">' + "".join(
+                f"<li>{escape(sentence_case(step))}</li>" for step in actions
+            ) + "</ol>"
+        term = _highlight_term(finding)
+        cards.append(
+            f'<article class="finding sev-{sev}" id="finding-{index}">'
+            '<div class="finding-head">'
+            f'<div class="rank">{index}</div>'
+            f"<div><h3>{escape(sentence_case(finding.title))}</h3>"
+            f'<div class="meta"><span class="chip sev-{sev}"><span class="dot"></span>{escape(SEVERITY_LABELS[sev])}</span>'
+            f'<span class="chip cat">{escape(category)}</span></div></div>'
+            f'<div class="share"><div class="num">{finding.pct:.1f}%</div><div class="of">of on-CPU time</div>'
+            f'<div class="meter" aria-hidden="true"><span style="width:{pct:.2f}%"></span></div></div>'
+            "</div>"
+            '<div class="finding-body">'
+            f'<div class="path" aria-label="call path">{_path_chips(finding.path)}</div>'
+            f"{steps}"
+            '<div class="actions">'
+            f'<button type="button" class="btn" data-highlight="{escape(term, quote=True)}">Show in flame graph</button>'
+            f'<button type="button" class="btn" data-copy="{escape(finding.path, quote=True)}">Copy path</button>'
+            "</div></div></article>"
+        )
+
+    # Conclusion.
+    def bullets(items: list[str]) -> str:
+        return "".join(f"<li>{escape(item)}</li>" for item in items)
+
+    todo = "".join(
+        f'<li><input type="checkbox" aria-label="done"><span>{escape(item)}</span></li>' for item in fix
+    )
+    plan = (
+        '<div class="plan">'
+        f'<div class="panel"><h3>Diagnosis</h3><ul>{bullets(wrong)}</ul></div>'
+        f'<div class="panel"><h3>Action plan</h3><ol class="todo">{todo}</ol></div>'
+        f'<div class="panel"><h3>Read with care</h3><ul>{bullets(unusual)}</ul></div>'
+        "</div>"
+    )
+
+    # Threads.
+    if report.no_comm:
+        threads = '<p class="hint">Process names were not recorded.</p>'
+    else:
+        rows = []
+        for name, samples in report.processes:
+            pct = share(samples, busy) if busy else 0.0
+            rows.append(
+                f'<div class="bar" title="{escape(name, quote=True)}: {pct:.1f}%"><div class="name">{escape(name)}</div>'
+                f'<div class="track"><span class="fill" style="width:{max(0.0, min(100.0, pct)):.2f}%"></span></div>'
+                f'<div class="pct">{pct:.1f}%</div></div>'
+            )
+        threads = f'<div class="bars">{"".join(rows)}</div>'
+
+    def table(rows: list[tuple[float, str, str]], label: str) -> str:
+        body = []
+        for samples, name, path in rows:
+            pct = share(samples, busy) if busy else 0.0
+            body.append(
+                f'<tr data-name="{escape(name, quote=True)}">'
+                f'<td><div class="fn mono">{escape(short_symbol(name, 160))}</div>'
+                f'<details><summary>Call path</summary><code>{escape(path)}</code></details></td>'
+                f'<td class="num">{pct:.1f}%<div class="inline-meter"><span style="width:{max(0.0, min(100.0, pct)):.2f}%"></span></div></td>'
+                "</tr>"
+            )
+        if not body:
+            body.append('<tr><td colspan="2" class="hint">None above 1% of the profile.</td></tr>')
+        return (
+            f"<table><thead><tr><th>Function</th><th class=\"num\">{escape(label)}</th></tr></thead>"
+            f"<tbody>{''.join(body)}</tbody></table>"
+        )
+
+    method_items = [
+        ("Width and self time",
+         "A frame's width is on-CPU time in that function and everything it called. Self time is the part not covered "
+         "by its children: that is where the CPU was."),
+        ("Weighting",
+         "Samples are weighted by the event count perf recorded on each one, as perf report does. "
+         "Use --weight samples to count each sample once." if report.weight == "period" else
+         "Each sample counts once." if report.weight == "samples" else "Folded counts are used as written."),
+        ("Threads",
+         "Numbered threads such as conn1 and conn2 are merged into conn*, so one code path is one tower. "
+         "Use --per-thread to keep them apart."),
+        ("Unnamed frames",
+         "[unknown] is every unnamed address in a module under one name. Its self time is counted under the nearest "
+         "named caller. Missing symbols are only raised when there is no named caller."),
+    ]
+    method = "".join(
+        f'<div class="panel"><h3>{escape(title)}</h3><p>{escape(text)}</p></div>' for title, text in method_items
+    )
+
+    search_icon = (
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+        'aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>'
+    )
+    parts = [
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n",
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+        "<title>CPU flame report</title>\n",
+        "<script>try{var t=localStorage.getItem('cpuflame-theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>\n",
+        f"<style>{PAGE_CSS}</style>\n</head>\n<body>\n",
+        '<header class="topbar"><div class="wrap">',
+        '<div class="brand">cpuflame<small>CPU flame report</small></div>',
+        '<nav class="nav" aria-label="Sections">'
+        '<a href="#summary">Summary</a><a href="#findings">Findings</a><a href="#plan">Action plan</a>'
+        '<a href="#threads">Threads</a><a href="#graph">Flame graph</a><a href="#frames">Hot functions</a>'
+        '<a href="#method">Method</a></nav>',
+        '<div class="tools"><button type="button" class="btn" id="theme">Dark</button>'
+        '<button type="button" class="btn" id="print">Print</button></div>',
+        "</div></header>\n<main class=\"wrap\">\n",
+        '<section class="hero" id="summary">',
+        '<p class="eyebrow">Verdict</p>',
+        f'<div class="verdict"><h1>{escape(verdict)}</h1></div>',
+        f'<p class="lede"><span class="chip sev-{top_sev}"><span class="dot"></span>{escape(sev_label)}</span> '
+        f"{len(report.findings)} finding{'s' if len(report.findings) != 1 else ''} below, largest cause first. "
+        "Percentages are shares of on-CPU time"
+        f"{' with idle left out' if report.idle > 0 else ''}.</p>",
+        f'<div class="tiles">{"".join(tiles)}</div>',
+        "</section>\n",
+        '<section id="findings"><div class="section-head"><h2>Findings</h2>'
+        '<p class="hint">Each card: what, how much, the call path, and what to do next.</p></div>',
+        f'<div class="findings">{"".join(cards)}</div></section>\n',
+        '<section id="plan"><div class="section-head"><h2>Conclusion and action plan</h2>'
+        '<p class="hint">Tick steps off as you go. The ticks are not saved.</p></div>',
+        plan,
+        "</section>\n",
+        '<section id="threads"><div class="section-head"><h2>Where the samples went</h2>'
+        '<p class="hint">Thread groups holding at least 1% of on-CPU time.</p></div>',
+        threads,
+        "</section>\n",
+        '<section id="graph"><div class="section-head"><h2>Flame graph</h2>'
+        '<p class="hint">Click a frame to zoom. Press / to search. Esc clears.</p></div>',
+        '<div class="graph-card"><div class="toolbar">',
+        f'<label class="search">{search_icon}<input id="flame-q" type="search" placeholder="Search functions (Enter zooms to the first match)" autocomplete="off" aria-label="Search functions"></label>',
+        '<span class="matches" id="matches" aria-live="polite"></span>',
+        '<button type="button" class="btn" id="reset">Reset zoom</button>',
+        '<button type="button" class="btn" id="tall">Full height</button>',
+        '<button type="button" class="btn" id="download">Download SVG</button>',
+        '<span class="legend"><span><i class="key" style="background:#3d7eb5"></i>thread</span>'
+        '<span><i class="key" style="background:var(--kernel)"></i>kernel</span>'
+        '<span><i class="key" style="background:var(--user)"></i>user code</span></span>',
+        "</div>",
+        f'<div id="stage" data-icicle="{"1" if icicle else "0"}">{svg_embedded(svg_markup)}</div></div>',
+        "</section>\n",
+        '<section id="frames"><div class="section-head"><h2>Hot functions</h2>'
+        '<div class="tabs" role="tablist">'
+        '<button type="button" role="tab" aria-selected="true" aria-controls="tab-self">Self time</button>'
+        '<button type="button" role="tab" aria-selected="false" aria-controls="tab-wide">Inclusive time</button>'
+        "</div></div>",
+        '<div class="table-card"><div class="table-tools">'
+        '<input class="filter" id="filter" type="search" placeholder="Filter functions" aria-label="Filter functions">'
+        '<span class="hint">Self time: where the CPU was. Inclusive: the function and everything it called.</span></div>',
+        f'<div id="tab-self">{table(report.hottest, "Self")}</div>',
+        f'<div id="tab-wide" class="hidden">{table(report.widest, "Inclusive")}</div>',
+        "</div></section>\n",
+        '<section id="method"><div class="section-head"><h2>How the numbers are counted</h2></div>',
+        f'<div class="method">{method}</div></section>\n',
+        "</main>\n",
+        '<footer><div class="wrap">Generated by cpuflame. Self-contained: nothing on this page is loaded from the network.</div></footer>\n',
+        '<div class="toast" id="toast" role="status"></div>\n',
+        f"<script>{PAGE_JS}</script>\n</body>\n</html>\n",
+    ]
+    return "".join(parts)
 
 
 def _metric_lines(rows: list[tuple[float, str, str]], total: float) -> list[str]:
@@ -2421,13 +3174,14 @@ def color_for(name: str, kind: str) -> str:
         green = 100 + ((digest >> 8) % 40)
         blue = 150 + ((digest >> 16) % 40)
     elif kind == "kernel":
-        red = 185 + (digest % 45)
-        green = 65 + ((digest >> 8) % 45)
-        blue = 25 + ((digest >> 16) % 25)
+        red = 190 + (digest % 40)
+        green = 70 + ((digest >> 8) % 40)
+        blue = 30 + ((digest >> 16) % 25)
     else:
-        red = 210 + (digest % 45)
-        green = 85 + ((digest >> 8) % 110)
-        blue = 20 + ((digest >> 16) % 30)
+        # Yellow to amber. Kept above the kernel's green channel so user and kernel frames do not look alike.
+        red = 225 + (digest % 30)
+        green = 175 + ((digest >> 8) % 50)
+        blue = 40 + ((digest >> 16) % 40)
     return f"rgb({red},{green},{blue})"
 
 
@@ -3074,10 +3828,14 @@ Hottest self time
 Hottest path
   python → main → serve → handle → query → find → index_scan → memcmp
 
+Where the work narrows
+   51.6%  find
+  python → main → serve → handle → query → find
+
 Findings
 1. memcmp is 31.4% of self time
    Path: python → main → serve → handle → query → find → index_scan → memcmp
-   Next: optimize memcmp first. This is where the CPU was.
+   Next: optimize memcmp first. This is where the CPU was. If it is server code you do not build, reduce the work that reaches it: the path shows the caller.
 
 2. malloc is 19.2% of self time
    Path: python → main → serve → handle → query → bson → malloc
@@ -3467,9 +4225,28 @@ other 8 [001] 10.530000:          1 cpu-clock:
         packed_tree = load_text(read_graph_input(packed), "auto", True, set())
         expect(find_frame(packed_tree, "decode_utf8") is not None, "gzip perf script was not parsed")
 
+    # MongoDB: a $lookup stage that drives most allocation is reported first, as the cause.
+    lookup = stacked([
+        ([comm("conn*"), user("mongo::Pipeline::getNext()"), user("mongo::DocumentSourceLookUp::doGetNext()"),
+          user("mongo::DocumentSourceLookUp::buildPipeline<false>()"), user("operator new(unsigned long)"),
+          user("tcmalloc::CpuCache::Refill(int)"), user("absl::base_internal::SpinLock::SpinLoop()")], 50),
+        ([comm("conn*"), user("mongo::Pipeline::getNext()"), user("mongo::DocumentSourceLookUp::doGetNext()"),
+          user("mongo::DocumentSourceLookUp::buildPipeline<false>()"), user("mongo::Pipeline::makePipeline()")], 20),
+        ([comm("conn*"), user("mongo::Pipeline::getNext()"), user("mongo::other()")], 30),
+    ])
+    first = lookup.split("Findings\n", 1)[1].splitlines()[0]
+    expect(first.startswith("1. the $lookup stage is 70.0%"), "the $lookup cause was not listed first: " + first)
+    expect("100% of all allocator time" in lookup and "building the inner pipeline" in lookup, "$lookup evidence missing")
+    expect("the lock is reached from the per-CPU cache slow path: tcmalloc::CpuCache::Refill(int)" in lookup, "slow path owner missing")
+    expect("Where the work narrows" in lookup, "work focus line missing")
+    expect(is_action("cut the allocation rate.") and not is_action("24.8% is lock contention inside tcmalloc"), "action split")
+    expect(sentence_case("mongod uses x") == "mongod uses x" and sentence_case("cut it") == "Cut it", "sentence case")
+
     page = render_html(analyze(example_tree(), 8), "<svg data-plot-width=\"1\"></svg>\n")
-    expect("What is wrong" in page and "memcmp" in page and "<svg" in page, "html report is missing the graph or the finding")
-    expect("Conclusion" in page and "What to do" in page and "Unusual" in page, "html report is missing the conclusion")
+    expect("Findings" in page and "memcmp" in page and "<svg" in page, "html report is missing the graph or the finding")
+    expect("Diagnosis" in page and "Action plan" in page and "Read with care" in page, "html report is missing the conclusion")
+    expect('data-highlight="memcmp"' in page, "finding card cannot highlight its frame")
+    expect("http://" not in page.replace("http://www.w3.org/2000/svg", "") and "https://" not in page, "html report loads from the network")
 
     print(f"self-test ok ({checks} checks)")
 
