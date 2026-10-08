@@ -1,8 +1,12 @@
 # cpuflame
 
-Record a CPU profile with Linux `perf`, draw an interactive flame graph, and write a short report that names the hot frames and what to try next.
+`cpuflame` shows where a Linux program spends CPU time, and what to look at next.
 
-You do not need `flamegraph.pl`. `cpuflame` draws the SVG and writes the report from `perf.data` or from `perf script` output.
+It samples the process with `perf`, draws an interactive flame graph, and writes a short report. The width of each frame is on-CPU time in that function, including everything it called. Blue is the process name, orange is the kernel, and yellow is user code. Click a frame to zoom. Type to search.
+
+The report names the frames that used the most CPU and gives a next step: missing symbols, a spinlock, the allocator, copies, kernel time, or no single hotspot. `cpuflame html` puts the graph and that conclusion on one page.
+
+You do not need `flamegraph.pl`. `cpuflame` reads `perf.data` from the machine that recorded it, or a `perf.script` text file sent from another server. A `perf report` file is not enough.
 
 Run the commands below from this repository. `tools/cpuflame` is a file in the repo, not a command installed on `PATH`.
 
