@@ -4,12 +4,16 @@ Record a CPU profile with Linux `perf`, draw an interactive flame graph, and wri
 
 One command does all three steps. You do not need `flamegraph.pl`.
 
+Run it from the repository root. `tools/cpuflame` is a file in this repo, not a command on `PATH`.
+
 ```bash
+git clone git@github.com:deepakraib/cpuflame.git
+cd cpuflame
 python3 tools/cpuflame check
 python3 tools/cpuflame run -o app.svg -- python3 app.py
 ```
 
-That writes `app.svg` and `app.txt`. Open the SVG in a browser.
+That writes `app.svg` and `app.txt` in the current directory. Open the SVG in a browser.
 
 ## Requirements
 
