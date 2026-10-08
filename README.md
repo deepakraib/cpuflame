@@ -77,7 +77,25 @@ The text is readable, and it is the input for the flame graph. If you already ha
 python3 tools/cpuflame html -i perf.script -o flamegraph.html
 ```
 
-Open `flamegraph.html` in a browser. It contains the flame graph, an explanation of how to read it, and the findings. The same step also writes `flamegraph.svg`.
+Open `flamegraph.html` in a browser. That is the report to read. The same command also writes `flamegraph.svg`.
+
+`cpuflame html` works from `perf.script`, from `perf.data`, or from folded stacks:
+
+```bash
+python3 tools/cpuflame html -i perf.script -o flamegraph.html
+python3 tools/cpuflame html -i perf.data -o flamegraph.html
+```
+
+The page has six parts:
+
+1. **Sample count and the split.** How many on-CPU samples were captured, and what share is user code versus kernel.
+2. **What is wrong.** One card per finding, largest first. Each card names the frame, the percent, the call path, and the next step. **Highlight in the graph** marks that frame in the picture.
+3. **Conclusion.** Three columns: what is wrong, what to do, and anything unusual in this profile. If symbols are missing, the conclusion says the graph cannot be used to tune the program yet, and how to record again.
+4. **Where the samples went.** Threads that hold at least 1% of the profile. Threads named `conn` plus a number are added together as connections.
+5. **The flame graph.** The same interactive SVG. The bottom row is the root. Blue is the process, orange is the kernel, yellow is user code. Click a frame to zoom. Type to search. Esc clears.
+6. **Widest frames and where the CPU actually was.** Inclusive time, then self time, each with the path from the root.
+
+Nothing on the page is fetched from the network. Send `flamegraph.html` as a single file. The SVG beside it is the same picture without the written analysis.
 
 Text-only outputs:
 
