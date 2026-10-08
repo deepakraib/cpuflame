@@ -531,6 +531,16 @@ SYSCALL_ENTRIES = frozenset({
     "do_syscall_32",
 })
 SYS_STUBS = ("__x64_sys_", "__ia32_sys_", "__se_sys_", "__do_sys_", "sys_")
+SYSCALL_DISPATCH = {"x64_sys_call", "__x64_sys_call"}
+PERF_OVERHEAD = {
+    "native_write_msr",
+    "intel_pmu_enable_all",
+    "x86_pmu_enable",
+    "perf_ctx_enable",
+    "__perf_event_task_sched_in",
+    "perf_event_task_sched_in",
+}
+CONN_RE = re.compile(r"^conn\d+$")
 IDLE_EXACT = frozenset({
     "do_idle",
     "cpu_startup_entry",
@@ -630,6 +640,8 @@ def is_alloc(name: str) -> bool:
     text = strip_symbol(name)
     if text.startswith("operator new") or text.startswith("operator delete"):
         return True
+    if "tcmalloc" in text:
+        return True
     if text.startswith(MANGLED_ALLOC):
         return True
     return matches_rules(text, ALLOC_RULES)
@@ -642,6 +654,8 @@ def is_copy(name: str) -> bool:
 def is_lock(name: str) -> bool:
     text = strip_symbol(name)
     if text.startswith("rw_lock_") and "_spin" in text:
+        return True
+    if "SpinLock" in text or "SpinLoop" in text:
         return True
     return matches_rules(text, LOCK_RULES)
 
@@ -721,7 +735,7 @@ def frame_after_syscall(path: tuple[str, ...]) -> str | None:
     for name in path[last + 1 :]:
         if is_syscall_entry(name):
             continue
-        if any(name.startswith(stub) for stub in SYS_STUBS):
+        if name in SYSCALL_DISPATCH or any(name.startswith(stub) for stub in SYS_STUBS):
             continue
         return name
     return None
@@ -764,8 +778,57 @@ def iter_views(view: View):
         yield from iter_views(child)
 
 
+def short_symbol(name: str, limit: int = 72) -> str:
+    if len(name) <= limit:
+        return name
+    return name[: limit - 1] + "…"
+
+
 def path_text(names: tuple[str, ...] | list[str]) -> str:
-    return " → ".join(names)
+    shown = [short_symbol(name) for name in names]
+    if len(shown) > 8:
+        shown = [shown[0], "…", *shown[-4:]]
+    return " → ".join(shown)
+
+
+def ancestor_has_frame(view: View, name: str, kind: str) -> bool:
+    parent = view.parent
+    while parent is not None and parent.depth > 0:
+        if parent.node.frame.name == name and parent.node.frame.kind == kind:
+            return True
+        parent = parent.parent
+    return False
+
+
+def summarize_processes(proc_totals: dict[str, float], busy: float, top: int) -> list[tuple[str, float]]:
+    """Group connection threads and keep the list to threads that hold real time."""
+    connections = 0.0
+    connection_count = 0
+    named: list[tuple[str, float]] = []
+    for name, samples in proc_totals.items():
+        if CONN_RE.match(name):
+            connections += samples
+            connection_count += 1
+        else:
+            named.append((name, samples))
+    rows: list[tuple[str, float]] = []
+    if connections > 0:
+        label = f"connections ({connection_count} threads)"
+        rows.append((label, connections))
+    rows.extend(named)
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    shown: list[tuple[str, float]] = []
+    other = 0.0
+    other_count = 0
+    for name, samples in rows:
+        if busy > 0 and samples / busy >= 0.01 and len(shown) < top:
+            shown.append((name, samples))
+        else:
+            other += samples
+            other_count += 1
+    if other > 0 and busy > 0:
+        shown.append((f"other ({other_count})", other))
+    return shown
 
 
 def is_passthrough(view: View) -> bool:
@@ -951,7 +1014,7 @@ def analyze(root: Node, top: int = 8) -> Report:
         if view.busy <= 0:
             continue
         proc_totals[view.node.frame.name] = proc_totals.get(view.node.frame.name, 0.0) + view.busy
-    processes = sorted(proc_totals.items(), key=lambda item: (-item[1], item[0]))
+    processes = summarize_processes(proc_totals, busy, top)
     no_comm = not comms
 
     groups: dict[tuple[str, str], list[View]] = {}
@@ -966,12 +1029,9 @@ def analyze(root: Node, top: int = 8) -> Report:
         if not all(is_passthrough(member) for member in members):
             inclusive = 0.0
             for member in members:
-                parent = member.parent
-                if (
-                    parent is not None
-                    and parent.node.frame.name == name
-                    and parent.node.frame.kind == kind
-                ):
+                # The same sample often passes through one function many times.
+                # Count it at the first visit so inclusive time cannot exceed 100%.
+                if ancestor_has_frame(member, name, kind):
                     continue
                 inclusive += member.busy
             if inclusive > 0:
@@ -1191,6 +1251,21 @@ def _kernel_finding(findings: list[Finding], views: list[View], busy: float) -> 
         return
     members = [view for view in kernel_views if bucket(view) == kind]
     hot = sorted(members, key=lambda view: (-view.busy_self, -view.busy, path_text(view.path)))[0]
+    if hot.node.frame.name in PERF_OVERHEAD:
+        add_finding(
+            findings,
+            Finding(
+                pct=share(kern_self, busy),
+                key=f"kernel:{hot.node.frame.name}",
+                title=f"kernel time is {share(kern_self, busy):.1f}% of self time",
+                path=path_text(hot.path),
+                steps=[
+                    f"{hot.node.frame.name} is perf turning the counter back on during a context switch. "
+                    "That time is not spent in the application."
+                ],
+            ),
+        )
+        return
     if kind == "spinlock":
         add_finding(
             findings,
@@ -1905,7 +1980,7 @@ Hottest self time
    10.5%  decode      python → main → serve → handle → parse_json → decode
     7.7%  deflate     python → main → serve → write → compress → deflate
     7.0%  epoll_wait  worker → loop → poll → epoll_wait
-    6.3%  vfs_read    python → main → serve → handle → query → find → read → entry_SYSCALL_64 → do_syscall_64 → vfs_read
+    6.3%  vfs_read    python → … → read → entry_SYSCALL_64 → do_syscall_64 → vfs_read
     4.2%  visit       python → gc → collect → visit
 
 Hottest path
@@ -2171,6 +2246,24 @@ other 8 [001] 10.530000:          1 cpu-clock:
     flags = build_parser().parse_args(["run", "--record-only", "--no-report", "-o", "out", "--", "true"])
     expect(flags.record_only and flags.no_report, "record-only with --no-report")
     expect(build_parser().prog == "cpuflame", "tool name")
+    expect(is_lock("absl::lts_20230802::base_internal::SpinLock::SpinLoop()"), "abseil spin was missed")
+    repeated = Node(Frame("all", "root"))
+    add_sample(
+        repeated,
+        [Frame("app", "comm"), Frame("foo", "user"), Frame("bar", "user"), Frame("foo", "user")],
+        10,
+    )
+    repeated_report = analyze(repeated, 8)
+    foo_width = [samples for samples, name, _path in repeated_report.widest if name == "foo"]
+    expect(foo_width == [10], "the same sample was counted twice in one function")
+    many = Node(Frame("all", "root"))
+    add_sample(many, [Frame("conn1", "comm"), Frame("work", "user")], 50)
+    add_sample(many, [Frame("conn2", "comm"), Frame("work", "user")], 30)
+    add_sample(many, [Frame("Checkpointer", "comm"), Frame("work", "user")], 20)
+    grouped = analyze(many, 8)
+    labels = [name for name, _samples in grouped.processes]
+    expect(any(name.startswith("connections (2 threads)") for name in labels), "connection threads were not grouped")
+    expect("conn1" not in labels and "conn2" not in labels, "individual connections were still listed")
     report_flags = build_parser().parse_args(["report", "-i", "stacks.txt", "--top", "3"])
     expect(report_flags.func == cmd_report and report_flags.top == 3, "report command")
 

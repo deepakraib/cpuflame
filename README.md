@@ -91,7 +91,7 @@ A wide parent is only a problem when its children do not already explain the tim
 `app.txt` sits next to the SVG. It has four parts.
 
 1. How to read the graph, in a few lines.
-2. Where the samples went: user code, kernel, and each process. Idle (`swapper`, or `do_idle` when the process name is hidden) is listed and then left out of the rest.
+2. Where the samples went: user code, kernel, and the threads that hold at least 1% of the profile. Threads named `conn` plus a number are added together as connections. Idle (`swapper`, or `do_idle` when the process name is hidden) is listed and then left out of the rest. A frame is never shown above 100%.
 3. The widest frames (inclusive time) and the frames with the most self time, each with the call path from the root. Frames that only pass the time to a single child are left off the widest list.
 4. Findings, largest first. Each one names the frame, the percent, the path, and a next step.
 
