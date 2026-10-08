@@ -70,11 +70,17 @@ The text is readable, and it is the input for the flame graph. If you already ha
 ### 4) Generate the flame graph
 
 ```bash
+python3 tools/cpuflame html -i perf.script -o flamegraph.html
+```
+
+Open `flamegraph.html` in a browser. It contains the flame graph, an explanation of how to read it, and the findings. The same step also writes `flamegraph.svg`.
+
+Text-only outputs:
+
+```bash
 python3 tools/cpuflame graph -i perf.script -o flamegraph.svg
 python3 tools/cpuflame report -i perf.script -o flamegraph.txt
 ```
-
-Open `flamegraph.svg` in a browser. `flamegraph.txt` names the hot frames and what to try next.
 
 From the binary `perf.data` file, skip step 3:
 
