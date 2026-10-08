@@ -6,7 +6,7 @@ It samples the process with `perf`, draws an interactive flame graph, and writes
 
 The report names the frames that used the most CPU and gives a next step: missing symbols, a spinlock, the allocator, copies, kernel time, or no single hotspot. `cpuflame html` puts the graph and that conclusion on one page.
 
-You do not need `flamegraph.pl`. `cpuflame` reads `perf.data` from the machine that recorded it, or a `perf.script` text file sent from another server. A `perf report` file is not enough.
+You do not need `flamegraph.pl`. `cpuflame` reads `perf.data` from the machine that recorded it, or a `perf.script` text file sent from another server. Files compressed with gzip, bzip2, xz, or zstd (`perf.script.zst`) are read as they are. A `perf report` file is not enough.
 
 Run the commands below from this repository. `tools/cpuflame` is a file in the repo, not a command installed on `PATH`.
 
@@ -91,7 +91,7 @@ The page has six parts:
 1. **Sample count and the split.** How many on-CPU samples were captured, and what share is user code versus kernel.
 2. **What is wrong.** One card per finding, largest first. Each card names the frame, the percent, the call path, and the next step. **Highlight in the graph** marks that frame in the picture.
 3. **Conclusion.** Three columns: what is wrong, what to do, and anything unusual in this profile. If symbols are missing, the conclusion says the graph cannot be used to tune the program yet, and how to record again.
-4. **Where the samples went.** Threads that hold at least 1% of the profile. Threads named `conn` plus a number are added together as connections.
+4. **Where the samples went.** Threads that hold at least 1% of the profile. Numbered threads (`conn1`, `conn2`, ...) are merged into one name (`conn*`), and `conn*` is shown as connections with the thread count.
 5. **The flame graph.** The same interactive SVG. The bottom row is the root. Blue is the process, orange is the kernel, yellow is user code. Click a frame to zoom. Type to search. Esc clears.
 6. **Widest frames and where the CPU actually was.** Inclusive time, then self time, each with the path from the root.
 
@@ -138,7 +138,7 @@ A wide parent is only a problem when its children do not already explain the tim
 `app.txt` sits next to the SVG. It has four parts.
 
 1. How to read the graph, in a few lines.
-2. Where the samples went: user code, kernel, and the threads that hold at least 1% of the profile. Threads named `conn` plus a number are added together as connections. Idle (`swapper`, or `do_idle` when the process name is hidden) is listed and then left out of the rest. A frame is never shown above 100%.
+2. Where the samples went: user code, kernel, and the threads that hold at least 1% of the profile. Numbered threads are merged (`conn*`), and connections are listed with their thread count. Idle (`swapper`, or `do_idle` when the process name is hidden) is listed and then left out of the rest. A frame is never shown above 100%.
 3. The widest frames (inclusive time) and the frames with the most self time, each with the call path from the root. Frames that only pass the time to a single child are left off the widest list.
 4. Findings, largest first. Each one names the frame, the percent, the path, and a next step.
 
@@ -154,9 +154,20 @@ A finding is raised only when the frame is a real share of the profile.
 | Kernel self time at least 20% | Named by the frame under the syscall (`vfs_read`, `tcp_sendmsg`), or as reclaim / transparent huge pages when the frames are `compact_zone`, `kswapd`, `shrink_*` |
 | Compression, parsing, or regex | The cost is in that library. The hottest frame inside it and the caller above it are named |
 | Python `_PyEval_EvalFrameDefault` | This is the eval loop, not your function. Re-record with `python -X perf` (3.12+) |
-| A wide `[unknown]` | Symbols are missing, so the graph cannot be trusted yet. Java and Node builds point at a perf map |
+| The allocator, with everything it calls, is at least 10% and its own named frames do not explain it | Raised as allocator time. Splits it into lock spinning inside the allocator, kernel time under it (by syscall), and the top callers. mongod gets a `db.serverStatus().tcmalloc` check |
+| `[unknown]` self time with no named caller, at least 10% | Symbols are missing, so the graph cannot be trusted yet. Java and Node builds point at a perf map |
 | A stack 48 frames deep, or one name repeated 6 times | Recursion or a callback loop |
 | Nothing above | No single CPU problem in this profile. If the time is spread out, the report names the deepest wide frame where the time actually splits |
+
+## How the numbers are counted
+
+**Weighting.** `perf script` prints an event count (the period) on each sample. `cpuflame` weights every sample by it, the way `perf report` does. With `-F 99` the kernel retunes the period all the time. The first samples after a context switch have a period of 1 and land in perf's own code (`native_write_msr`). Counting each sample as 1 makes perf look like a large share of the profile. In one mongod capture it was 13.9% by sample count and 0.1% by event count. `--weight samples` counts every sample as 1. Folded input keeps its own counts.
+
+**Threads.** Numbered threads merge into one name: `conn1234` and `conn99` become `conn*`. One code path is then one tower, not one per connection. A name merges only when at least two threads share it. `--per-thread` keeps them apart.
+
+**Unnamed frames.** perf writes `[unknown]` for static or stripped functions. Every unnamed address in a module gets the same name, so an `[unknown]` frame is not one function. Its self time is counted under the nearest named caller and listed as `[unknown] in <caller>`. `[unknown]` frames are left out of the widest list and of the recursion check. Missing symbols are raised only for unnamed time that has no named caller.
+
+**Kernel frames.** A frame is kernel when perf names `[kernel.kallsyms]`, a loadable module such as `[xfs]`, or the address is in kernel space. perf re-arming its counters (`native_write_msr`, `perf_adjust_freq_unthr_context`) is reported as measurement overhead, not as a kernel finding.
 
 ## Folded stacks
 
@@ -166,7 +177,7 @@ Folded input still works. A line is a stack and a count:
 main;foo;bar 12
 ```
 
-Files produced by `stackcollapse-perf.pl` mark kernel frames with `_[k]`. In those files the first frame is the process name. A plain file with no mark keeps every frame as user code, including `main`.
+Files produced by `stackcollapse-perf.pl` put the process name first. With `--kernel` they mark kernel frames with `_[k]`. Without symbols they write the module in brackets, such as `[mongod]` or `[[kernel.kallsyms]]`. `cpuflame` reads either form: the first frame is the process, `[mongod]` is an unnamed frame in mongod, and `[[kernel.kallsyms]]` is kernel. A plain file with neither keeps every frame as user code, including `main`.
 
 ## Check the script
 

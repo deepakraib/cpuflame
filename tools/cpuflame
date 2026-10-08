@@ -35,6 +35,17 @@ TS_RE = re.compile(r"(?:^|\s)\d+\.\d+:")
 FOLDED_RE = re.compile(r"^(.*\S)\s+([0-9]+(?:\.[0-9]+)?)\s*$")
 MARK_RE = re.compile(r"_(?: )?\[([kuij])\]$")
 CLONE_RE = re.compile(r"\.(?:constprop|isra|part|cold)(?:\.\d+)?$")
+# perf script sample header: comm (may contain spaces), pid[/tid], optional [cpu], time:, optional period, event.
+HEADER_RE = re.compile(
+    r"^\s*(?P<comm>\S.*?)\s+(?P<pid>-?\d+)(?:/(?P<tid>-?\d+))?\s+(?:\[(?P<cpu>\d+)\]\s+)?"
+    r"(?P<time>\d+\.\d+):\s*(?P<rest>.*)$"
+)
+ADDR_RE = re.compile(r"^\s+([0-9a-fA-F]+)\s")
+# Frames under this address are user space on x86_64 and arm64. Kernel text and modules sit above it.
+KERNEL_ADDR = 0xFFFF800000000000
+USER_PSEUDO_MODULES = frozenset({"[vdso]", "[vsyscall]", "[vectors]", "[unknown]", "[heap]", "[stack]", "[anon]", "[jit]"})
+THREAD_NUM_RE = re.compile(r"^(?P<base>.*\D)\d+$")
+BRACKET_MODULE_RE = re.compile(r"^\[(?P<module>[^\[\]]+|\[kernel\.kallsyms\])\]$")
 
 SCRIPT = r"""
 function init() {
@@ -206,10 +217,14 @@ class Frame:
 
 
 class Node:
+    __slots__ = ("frame", "samples", "children", "meta")
+
     def __init__(self, frame: Frame):
         self.frame = frame
         self.samples = 0
         self.children: dict[Frame, Node] = {}
+        # Only the root uses meta: sample count, weighting, merged thread counts.
+        self.meta: dict | None = None
 
     def child(self, frame: Frame) -> Node:
         node = self.children.get(frame)
@@ -243,33 +258,131 @@ def clean_name(name: str) -> str:
     return name or "[unnamed]"
 
 
-def tidy(symbol: str, module: str) -> Frame:
+def is_kernel_module(module: str, address: int | None) -> bool:
+    """[kernel.kallsyms], a loadable module such as [xfs], or a kernel address."""
+    if "kernel" in module.lower():
+        return True
+    if module.startswith("[") and module.endswith("]") and module not in USER_PSEUDO_MODULES:
+        return True
+    return address is not None and address >= KERNEL_ADDR
+
+
+def tidy(symbol: str, module: str, address: int | None = None) -> Frame:
     symbol = symbol.strip()
     module = module.strip()
     if module == "inline":
         symbol = f"{symbol} [inline]"
         module = ""
     symbol = OFFSET_RE.sub("", symbol).strip()
-    kind = "kernel" if "kernel" in module.lower() else "user"
+    kind = "kernel" if is_kernel_module(module, address) else "user"
     if symbol in ("[unknown]", ""):
         base = module.rsplit("/", 1)[-1] if module else "unknown"
         symbol = f"[unknown] {base}"
     return Frame(clean_name(symbol), kind)
 
 
+def frame_address(line: str) -> int | None:
+    match = ADDR_RE.match(line)
+    if not match:
+        return None
+    try:
+        return int(match.group(1), 16)
+    except ValueError:
+        return None
+
+
 def parse_frame(line: str) -> Frame:
+    address = frame_address(line)
     match = MODULE_RE.match(line)
     if match:
-        return tidy(match.group(1), match.group(2))
+        return tidy(match.group(1), match.group(2), address)
     match = PLAIN_RE.match(line)
     if match:
-        return tidy(match.group(1), "")
+        return tidy(match.group(1), "", address)
     return Frame("[unparsed]", "user")
 
 
+@dataclass
+class Header:
+    comm: str
+    period: int | None
+    event: str
+
+
+def parse_header(line: str) -> Header | None:
+    """Read a perf script sample header. None when the line is not one."""
+    match = HEADER_RE.match(line)
+    if not match:
+        if not TS_RE.search(line) or FRAME_RE.match(line):
+            return None
+        parts = line.split()
+        return Header(parts[0] if parts else "?", None, "")
+    rest = match.group("rest").split()
+    period: int | None = None
+    event = ""
+    if len(rest) >= 2 and rest[0].isdigit():
+        period = int(rest[0])
+        event = rest[1]
+    elif rest:
+        event = rest[0]
+    return Header(match.group("comm").strip(), period, event.rstrip(":"))
+
+
 def parse_comm(line: str) -> str:
+    header = parse_header(line)
+    if header is not None:
+        return header.comm
     parts = line.split()
     return parts[0] if parts else "?"
+
+
+def thread_base(comm: str) -> str | None:
+    """conn1234 -> conn*, swapper/3 -> swapper/*. None when there is no trailing number."""
+    match = THREAD_NUM_RE.match(comm)
+    if not match or not match.group("base").strip():
+        return None
+    return match.group("base") + "*"
+
+
+def thread_merge_map(comms) -> tuple[dict[str, str], dict[str, int]]:
+    """Merge numbered threads (conn1, conn2, ...) when at least two share a base name."""
+    members: dict[str, set[str]] = {}
+    for comm in comms:
+        base = thread_base(comm)
+        if base is not None:
+            members.setdefault(base, set()).add(comm)
+    mapping: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for base, names in members.items():
+        if len(names) < 2:
+            continue
+        counts[base] = len(names)
+        for name in names:
+            mapping[name] = base
+    return mapping, counts
+
+
+def scan_headers(text: str) -> tuple[set[str], bool, list[str]]:
+    """First pass over perf script text: thread names, whether every header has a period, events."""
+    comms: set[str] = set()
+    events: set[str] = set()
+    every_period = True
+    seen = False
+    for line in text.splitlines():
+        if not line or line.startswith("#") or line[:1] == "\t":
+            continue
+        if not TS_RE.search(line):
+            continue
+        header = parse_header(line)
+        if header is None:
+            continue
+        seen = True
+        comms.add(header.comm)
+        if header.event:
+            events.add(header.event)
+        if header.period is None:
+            every_period = False
+    return comms, seen and every_period, sorted(events)
 
 
 def add_sample(root: Node, frames: list[Frame], weight: float) -> None:
@@ -280,47 +393,84 @@ def add_sample(root: Node, frames: list[Frame], weight: float) -> None:
         node.samples += weight
 
 
-def load_perf_script(text: str, include_comm: bool, comm_filter: set[str]) -> Node:
+def load_perf_script(
+    text: str,
+    include_comm: bool,
+    comm_filter: set[str],
+    weight: str = "auto",
+    per_thread: bool = False,
+) -> Node:
+    """Build the stack tree from perf script text.
+
+    weight: "period" uses the event count perf printed on each header (what perf report
+    uses), "samples" counts every sample as 1, "auto" picks period when every header has one.
+    With -F frequency sampling the first samples after a context switch carry a period
+    of 1 and land in perf's own code (native_write_msr). Counting them as 1 each
+    makes perf look like a large share of the profile.
+    """
+    if weight not in ("auto", "period", "samples"):
+        raise SystemExit("--weight must be auto, period, or samples")
     root = Node(Frame("all", "root"))
-    current_comm: str | None = None
+    comms, has_period, events = scan_headers(text)
+    if weight == "period" and not has_period:
+        raise SystemExit(
+            "--weight period needs a period on every sample header. "
+            "Re-run perf script without -F, or use --weight samples."
+        )
+    use_period = has_period and weight in ("auto", "period")
+    mapping, thread_counts = ({}, {}) if per_thread else thread_merge_map(comms)
+    current: Header | None = None
     leaf_first: list[Frame] = []
     saw_header = False
+    count = 0
 
     def flush() -> None:
-        nonlocal current_comm, leaf_first
-        if current_comm is None:
+        nonlocal current, leaf_first, count
+        if current is None:
             return
-        comm = current_comm
+        header = current
         frames = leaf_first
-        current_comm = None
+        current = None
         leaf_first = []
-        if comm_filter and comm not in comm_filter:
+        comm = header.comm
+        if comm_filter and comm not in comm_filter and mapping.get(comm, comm) not in comm_filter:
             return
         stack = list(reversed(frames))
         if not stack:
             stack = [Frame("[no stack]", "user")]
         if include_comm:
-            stack = [Frame(clean_name(comm), "comm")] + stack
-        add_sample(root, stack, 1)
+            stack = [Frame(clean_name(mapping.get(comm, comm)), "comm")] + stack
+        count += 1
+        add_sample(root, stack, (header.period or 0) if use_period else 1)
 
     for line in text.splitlines():
         if not line.strip() or line.startswith("#"):
-            if not line.strip() and current_comm is not None:
+            if not line.strip() and current is not None:
                 flush()
             continue
+        if not line.startswith("\t") and TS_RE.search(line):
+            header = parse_header(line)
+            if header is not None:
+                flush()
+                saw_header = True
+                current = header
+                leaf_first = []
+                continue
         if FRAME_RE.match(line):
-            if current_comm is None:
-                current_comm = "?"
+            if current is None:
+                current = Header("?", None, "")
             leaf_first.append(parse_frame(line))
             continue
-        if TS_RE.search(line):
-            flush()
-            saw_header = True
-            current_comm = parse_comm(line)
-            leaf_first = []
-            continue
     flush()
+    root.meta = {
+        "sample_count": count,
+        "weight": "period" if use_period else "samples",
+        "events": events,
+        "threads": thread_counts if include_comm else {},
+    }
 
+    if root.samples == 0 and count and use_period:
+        raise SystemExit("Every sample has a period of 0. Use --weight samples.")
     if root.samples == 0:
         if comm_filter and saw_header:
             raise SystemExit(
@@ -354,12 +504,52 @@ def folded_has_marks(text: str) -> bool:
     return False
 
 
-def load_folded(text: str, comm_filter: set[str], include_comm: bool = True) -> Node:
+def folded_is_collapsed(text: str) -> bool:
+    """stackcollapse-perf output without _[k] marks: frames such as [mongod] or [[kernel.kallsyms]]."""
+    checked = 0
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        match = FOLDED_RE.match(line)
+        if not match:
+            continue
+        checked += 1
+        for part in match.group(1).split(";")[1:]:
+            part = part.strip()
+            if BRACKET_MODULE_RE.match(part) and part != "[unknown]":
+                return True
+        if checked >= 2000:
+            break
+    return False
+
+
+def folded_frame(part: str, mark: str | None, collapsed: bool) -> Frame:
+    base = clean_name(part)
+    if collapsed:
+        bracket = BRACKET_MODULE_RE.match(base)
+        if bracket and base != "[unknown]":
+            module = bracket.group("module")
+            kind = "kernel" if is_kernel_module(module, None) or module.startswith("[kernel") else "user"
+            module = module.strip("[]")
+            if module == "kernel.kallsyms":
+                module = "[kernel.kallsyms]"
+                kind = "kernel"
+            return Frame(f"[unknown] {module}", kind)
+    if mark == "k":
+        return Frame(base, "kernel")
+    return Frame(base, "user")
+
+
+def load_folded(text: str, comm_filter: set[str], include_comm: bool = True, per_thread: bool = False) -> Node:
     root = Node(Frame("all", "root"))
     skipped = 0
+    count = 0
     # Plain folded input (main;foo;bar 12) stays all user frames.
-    # stackcollapse-perf.pl marks kernel frames and puts the process name first.
+    # stackcollapse-perf.pl puts the process name first. It marks kernel frames with _[k]
+    # when asked, and writes [module] when a frame has no symbol.
     marked = folded_has_marks(text)
+    collapsed = marked or folded_is_collapsed(text)
+    rows: list[tuple[list[str], str]] = []
     for line in text.splitlines():
         if not line.strip() or line.startswith("#"):
             continue
@@ -368,26 +558,43 @@ def load_folded(text: str, comm_filter: set[str], include_comm: bool = True) -> 
             skipped += 1
             continue
         raw_parts = [part.strip() for part in match.group(1).split(";") if part.strip()]
+        if not raw_parts:
+            skipped += 1
+            continue
+        rows.append((raw_parts, match.group(2)))
+    mapping: dict[str, str] = {}
+    thread_counts: dict[str, int] = {}
+    if collapsed and not per_thread:
+        mapping, thread_counts = thread_merge_map({parts[0] for parts, _weight in rows})
+    for raw_parts, raw_weight in rows:
         frames: list[Frame] = []
+        comm_name = raw_parts[0] if collapsed else None
+        if comm_filter:
+            first = comm_name if comm_name is not None else raw_parts[0]
+            if first not in comm_filter and mapping.get(first, first) not in comm_filter:
+                continue
         for index, part in enumerate(raw_parts):
             base, mark = split_folded_name(part) if marked else (part, None)
             base = clean_name(base)
             if not base:
                 continue
-            if marked and index == 0 and include_comm and mark != "k":
-                kind = "comm"
-            elif mark == "k":
-                kind = "kernel"
-            else:
-                kind = "user"
-            frames.append(Frame(base, kind))
+            if collapsed and index == 0 and mark != "k":
+                if include_comm:
+                    frames.append(Frame(clean_name(mapping.get(base, base)), "comm"))
+                continue
+            frames.append(folded_frame(base, mark, collapsed))
         if not frames:
             skipped += 1
             continue
-        if comm_filter and frames[0].name not in comm_filter:
-            continue
-        weight = float(match.group(2)) if "." in match.group(2) else int(match.group(2))
+        weight = float(raw_weight) if "." in raw_weight else int(raw_weight)
+        count += 1
         add_sample(root, frames, weight)
+    root.meta = {
+        "sample_count": count,
+        "weight": "folded",
+        "events": [],
+        "threads": thread_counts if include_comm else {},
+    }
     if root.samples == 0:
         if comm_filter:
             raise SystemExit("No folded stacks matched --comm. For folded input the first frame is the process name.")
@@ -410,11 +617,18 @@ def detect_format(text: str) -> str:
     return "folded"
 
 
-def load_text(text: str, fmt: str, include_comm: bool, comm_filter: set[str]) -> Node:
+def load_text(
+    text: str,
+    fmt: str,
+    include_comm: bool,
+    comm_filter: set[str],
+    weight: str = "auto",
+    per_thread: bool = False,
+) -> Node:
     kind = detect_format(text) if fmt == "auto" else fmt
     if kind == "script":
-        return load_perf_script(text, include_comm, comm_filter)
-    return load_folded(text, comm_filter, include_comm)
+        return load_perf_script(text, include_comm, comm_filter, weight=weight, per_thread=per_thread)
+    return load_folded(text, comm_filter, include_comm, per_thread=per_thread)
 
 
 DOMINANT_SELF = 0.30
@@ -432,6 +646,8 @@ REPEAT_TIMES = 6
 DEEP_SHARE = 0.05
 INTERPRETER_SELF = 0.15
 LIST_MIN = 0.01
+ALLOC_INCLUSIVE = 0.10
+PERF_NOTE = 0.02
 
 ISA_TAILS = frozenset({
     "avx", "avx2", "avx512", "sse", "sse2", "ssse3", "sse4", "sse41", "sse42",
@@ -540,6 +756,8 @@ SYSCALL_ENTRIES = frozenset({
 SYS_STUBS = ("__x64_sys_", "__ia32_sys_", "__se_sys_", "__do_sys_", "sys_")
 SYSCALL_DISPATCH = {"x64_sys_call", "__x64_sys_call"}
 PERF_OVERHEAD = {
+    "perf_adjust_freq_unthr_context",
+    "perf_event_update_userpage",
     "native_write_msr",
     "intel_pmu_enable_all",
     "x86_pmu_enable",
@@ -547,7 +765,12 @@ PERF_OVERHEAD = {
     "__perf_event_task_sched_in",
     "perf_event_task_sched_in",
 }
-CONN_RE = re.compile(r"^conn\d+$")
+CONN_RE = re.compile(r"^conn(?:\d+|\*)$")
+# Frames that only start a thread. Unnamed code under them cannot be pinned to a function.
+TRUNK = frozenset({
+    "start_thread", "clone", "clone3", "__clone", "__clone3", "_start", "__libc_start_main",
+    "__libc_start_call_main", "thread_start", "ret_from_fork", "ret_from_fork_asm", "main",
+})
 IDLE_EXACT = frozenset({
     "do_idle",
     "cpu_startup_entry",
@@ -807,15 +1030,23 @@ def ancestor_has_frame(view: View, name: str, kind: str) -> bool:
     return False
 
 
-def summarize_processes(proc_totals: dict[str, float], busy: float, top: int) -> list[tuple[str, float]]:
+def summarize_processes(
+    proc_totals: dict[str, float],
+    busy: float,
+    top: int,
+    thread_counts: dict[str, int] | None = None,
+) -> list[tuple[str, float]]:
     """Group connection threads and keep the list to threads that hold real time."""
+    thread_counts = thread_counts or {}
     connections = 0.0
     connection_count = 0
     named: list[tuple[str, float]] = []
     for name, samples in proc_totals.items():
         if CONN_RE.match(name):
             connections += samples
-            connection_count += 1
+            connection_count += thread_counts.get(name, 1)
+        elif name in thread_counts:
+            named.append((f"{name} ({thread_counts[name]} threads)", samples))
         else:
             named.append((name, samples))
     rows: list[tuple[str, float]] = []
@@ -865,6 +1096,14 @@ class Report:
     hottest: list[tuple[float, str, str]]
     hottest_path: str
     findings: list[Finding]
+    sample_count: int = 0
+    weight: str = "samples"
+    events: tuple[str, ...] = ()
+    perf_overhead: float = 0.0
+    unknown_self: float = 0.0
+    unknown_unattributed: float = 0.0
+    unknown_owners: tuple[tuple[str, float], ...] = ()
+    unknown_modules: tuple[str, ...] = ()
 
 
 def add_finding(findings: list[Finding], finding: Finding) -> None:
@@ -883,12 +1122,49 @@ def add_finding(findings: list[Finding], finding: Finding) -> None:
 
 
 def caller_name(view: View, pred) -> str:
+    """First caller that is not matched by pred and has a name."""
     node = view.parent
-    while node is not None and node.depth > 0 and pred(node.node.frame.name):
+    while node is not None and node.depth > 0 and (pred(node.node.frame.name) or is_unknown(node.node.frame.name)):
         node = node.parent
-    if node is None or node.depth == 0:
-        return "the root"
+    if node is None or node.depth == 0 or node.node.frame.kind == "comm":
+        return "the root" if node is None or node.depth == 0 else f"the {node.node.frame.name} thread"
     return node.node.frame.name
+
+
+def named_owner(view: View) -> View | None:
+    """The view itself when it has a name, else the nearest named caller.
+
+    perf writes [unknown] for static or stripped functions. Their time belongs to the
+    named function that called them. None when only thread-start frames are above.
+    """
+    node: View | None = view
+    while node is not None and node.depth > 0:
+        frame = node.node.frame
+        if frame.kind == "comm":
+            return None
+        if not is_unknown(frame.name):
+            if frame.name in TRUNK:
+                return None
+            return node
+        node = node.parent
+    return None
+
+
+def owner_name(view: View) -> str:
+    """Name used to group self time: unnamed frames count under their named caller."""
+    if not is_unknown(view.node.frame.name):
+        return view.node.frame.name
+    owner = named_owner(view)
+    return owner.node.frame.name if owner is not None else view.node.frame.name
+
+
+def under(view: View, pred) -> bool:
+    node = view.parent
+    while node is not None and node.depth > 0:
+        if pred(node.node.frame.name):
+            return True
+        node = node.parent
+    return False
 
 
 def share(part: float, whole: float) -> float:
@@ -961,13 +1237,14 @@ def group_self(
         return None
     by_name: dict[str, float] = {}
     for view in matched:
-        by_name[view.node.frame.name] = by_name.get(view.node.frame.name, 0.0) + view.busy_self
+        name = owner_name(view)
+        by_name[name] = by_name.get(name, 0.0) + view.busy_self
     total_self = sum(by_name.values())
     top_name = sorted(by_name, key=lambda item: (-by_name[item], item))[0]
     if by_name[top_name] < CATEGORY_SELF * total and total_self < CATEGORY_GROUP * total:
         return None
     hottest = sorted(
-        (view for view in matched if view.node.frame.name == top_name),
+        (view for view in matched if owner_name(view) == top_name),
         key=lambda view: (-view.busy_self, -view.busy, path_text(view.path)),
     )[0]
     return top_name, by_name[top_name], total_self, hottest
@@ -1007,6 +1284,7 @@ def hottest_inside(entries: list[View]) -> View | None:
 def analyze(root: Node, top: int = 8) -> Report:
     if top < 1:
         raise SystemExit("--top must be at least 1")
+    meta = root.meta or {}
     view_root = build_view(root, None, 0, False)
     views = list(iter_views(view_root))
     busy = view_root.busy
@@ -1015,13 +1293,16 @@ def analyze(root: Node, top: int = 8) -> Report:
         idle = 0.0
     kernel_self = sum(view.busy_self for view in views if view.node.frame.kind == "kernel")
     user_self = busy - kernel_self
+    perf_overhead = sum(
+        view.busy_self for view in views if view.node.frame.kind == "kernel" and strip_symbol(view.node.frame.name) in PERF_OVERHEAD
+    )
     comms = [view for view in views if view.node.frame.kind == "comm"]
     proc_totals: dict[str, float] = {}
     for view in comms:
         if view.busy <= 0:
             continue
         proc_totals[view.node.frame.name] = proc_totals.get(view.node.frame.name, 0.0) + view.busy
-    processes = summarize_processes(proc_totals, busy, top)
+    processes = summarize_processes(proc_totals, busy, top, meta.get("threads") or {})
     no_comm = not comms
 
     groups: dict[tuple[str, str], list[View]] = {}
@@ -1031,25 +1312,51 @@ def analyze(root: Node, top: int = 8) -> Report:
         groups.setdefault((view.node.frame.name, view.node.frame.kind), []).append(view)
 
     wide_rows: list[tuple[float, str, str]] = []
-    self_rows: list[tuple[float, str, str]] = []
     for (name, kind), members in groups.items():
-        if not all(is_passthrough(member) for member in members):
-            inclusive = 0.0
-            for member in members:
-                # The same sample often passes through one function many times.
-                # Count it at the first visit so inclusive time cannot exceed 100%.
-                if ancestor_has_frame(member, name, kind):
-                    continue
-                inclusive += member.busy
-            if inclusive > 0:
-                best = sorted(members, key=lambda member: (-member.busy, member.depth, path_text(member.path)))[0]
-                wide_rows.append((inclusive, name, path_text(best.path)))
-        self_total = sum(member.busy_self for member in members)
-        if self_total > 0:
-            best_self = sorted(
-                members, key=lambda member: (-member.busy_self, -member.busy, path_text(member.path))
-            )[0]
-            self_rows.append((self_total, name, path_text(best_self.path)))
+        # [unknown] merges every unnamed address in a module into one name. Its width is not one function.
+        if is_unknown(name):
+            continue
+        if all(is_passthrough(member) for member in members):
+            continue
+        inclusive = 0.0
+        for member in members:
+            # The same sample often passes through one function many times.
+            # Count it at the first visit so inclusive time cannot exceed 100%.
+            if ancestor_has_frame(member, name, kind):
+                continue
+            inclusive += member.busy
+        if inclusive > 0:
+            best = sorted(members, key=lambda member: (-member.busy, member.depth, path_text(member.path)))[0]
+            wide_rows.append((inclusive, name, path_text(best.path)))
+
+    # Self time. Unnamed frames are listed as "[unknown] in <named caller>".
+    self_totals: dict[str, float] = {}
+    self_best: dict[str, View] = {}
+    unknown_self = 0.0
+    unattributed = 0.0
+    owners: dict[str, float] = {}
+    modules: dict[str, float] = {}
+    for view in views:
+        if view.depth == 0 or view.node.frame.kind in ("comm", "root") or view.busy_self <= 0:
+            continue
+        name = view.node.frame.name
+        label = name
+        if is_unknown(name):
+            unknown_self += view.busy_self
+            owner = named_owner(view)
+            if owner is None:
+                unattributed += view.busy_self
+                module = name[len("[unknown]"):].strip() or "unknown"
+                modules[module] = modules.get(module, 0.0) + view.busy_self
+            else:
+                owners[owner.node.frame.name] = owners.get(owner.node.frame.name, 0.0) + view.busy_self
+                label = f"[unknown] in {owner.node.frame.name}"
+        self_totals[label] = self_totals.get(label, 0.0) + view.busy_self
+        current = self_best.get(label)
+        key = (-view.busy_self, -view.busy, path_text(view.path))
+        if current is None or key < (-current.busy_self, -current.busy, path_text(current.path)):
+            self_best[label] = view
+    self_rows = [(total, label, path_text(self_best[label].path)) for label, total in self_totals.items()]
     wide_rows.sort(key=lambda row: (-row[0], row[1]))
     self_rows.sort(key=lambda row: (-row[0], row[2], row[1]))
     widest = trim_rows(wide_rows, busy, top)
@@ -1058,7 +1365,7 @@ def analyze(root: Node, top: int = 8) -> Report:
 
     findings: list[Finding] = []
     if busy > 0:
-        _collect_findings(findings, views, busy, set(proc_totals))
+        _collect_findings(findings, views, busy, set(proc_totals), unattributed, modules)
         findings.sort(key=lambda finding: (-finding.pct, finding.title))
         if not findings:
             spread = _spread_finding(views, busy)
@@ -1078,17 +1385,36 @@ def analyze(root: Node, top: int = 8) -> Report:
         hottest=hottest,
         hottest_path=hottest_path,
         findings=findings,
+        sample_count=int(meta.get("sample_count", 0) or 0),
+        weight=str(meta.get("weight", "samples")),
+        events=tuple(meta.get("events") or ()),
+        perf_overhead=perf_overhead,
+        unknown_self=unknown_self,
+        unknown_unattributed=unattributed,
+        unknown_owners=tuple(sorted(owners.items(), key=lambda item: (-item[1], item[0]))),
+        unknown_modules=tuple(sorted(modules, key=lambda item: (-modules[item], item))),
     )
 
 
-def _collect_findings(findings: list[Finding], views: list[View], busy: float, comms: set[str]) -> None:
+def _collect_findings(
+    findings: list[Finding],
+    views: list[View],
+    busy: float,
+    comms: set[str],
+    unattributed: float = 0.0,
+    modules: dict[str, float] | None = None,
+) -> None:
+    # Self time by function. Unnamed frames count under the named function that called them.
     by_name: dict[str, float] = {}
+    unnamed_part: dict[str, float] = {}
     best_for: dict[str, View] = {}
     for view in views:
         if view.depth == 0 or view.busy_self <= 0 or view.node.frame.kind in ("comm", "root"):
             continue
-        name = view.node.frame.name
+        name = owner_name(view)
         by_name[name] = by_name.get(name, 0.0) + view.busy_self
+        if name != view.node.frame.name:
+            unnamed_part[name] = unnamed_part.get(name, 0.0) + view.busy_self
         current = best_for.get(name)
         if current is None:
             best_for[name] = view
@@ -1114,6 +1440,15 @@ def _collect_findings(findings: list[Finding], views: list[View], busy: float, c
             ),
         )
 
+    def unnamed_note(name: str) -> list[str]:
+        part = unnamed_part.get(name, 0.0)
+        if part <= 0:
+            return []
+        return [
+            f"{share(part, busy):.1f}% of it is in unnamed code that {name} calls "
+            "(static or inlined functions with no symbol). Install debug symbols to name them."
+        ]
+
     ranked = sorted(by_name, key=lambda name: (-by_name[name], path_text(best_for[name].path)))
     for name in ranked:
         if is_interpreter(name) or is_unknown(name):
@@ -1128,21 +1463,22 @@ def _collect_findings(findings: list[Finding], views: list[View], busy: float, c
                 key=name,
                 title=f"{name} is {share(by_name[name], busy):.1f}% of self time",
                 path=path_text(hot.path),
-                steps=[f"optimize {name} first. This is where the CPU was."],
+                steps=[f"optimize {name} first. This is where the CPU was.", *unnamed_note(name)],
             ),
         )
         break
 
     def alloc_pred(view: View) -> bool:
-        return is_alloc(view.node.frame.name)
+        return is_alloc(owner_name(view))
 
     def copy_pred(view: View) -> bool:
-        if not is_copy(view.node.frame.name):
+        if not is_copy(owner_name(view)):
             return False
         return not any(is_page_fault_entry(name) for name in view.path)
 
     def lock_pred(view: View) -> bool:
-        return is_lock(view.node.frame.name)
+        # A lock taken inside the allocator is reported with the allocator.
+        return is_lock(owner_name(view)) and not under(view, is_alloc)
 
     def emit_group(found, step: str) -> None:
         if found is None:
@@ -1163,10 +1499,11 @@ def _collect_findings(findings: list[Finding], views: list[View], busy: float, c
             ),
         )
 
-    alloc = group_self(views, alloc_pred, busy)
-    if alloc is not None:
-        _name, _own, _total_self, hot = alloc
-        emit_group(alloc, f"cut the allocation rate. The caller is {caller_name(hot, is_alloc)}.")
+    if not _allocator_finding(findings, views, busy):
+        alloc = group_self(views, alloc_pred, busy)
+        if alloc is not None:
+            _name, _own, _total_self, hot = alloc
+            emit_group(alloc, f"cut the allocation rate. The caller is {caller_name(hot, is_alloc)}.")
     copied = group_self(views, copy_pred, busy)
     if copied is not None:
         _name, _own, _total_self, hot = copied
@@ -1230,14 +1567,155 @@ def _collect_findings(findings: list[Finding], views: list[View], busy: float, c
                 )
 
     _kernel_finding(findings, views, busy)
-    _unknown_finding(findings, views, busy, comms)
+    _unknown_finding(findings, views, busy, comms, unattributed, modules or {})
     _deep_finding(findings, views, busy)
 
 
+def allocator_family(names) -> str:
+    joined = " ".join(names)
+    if "tcmalloc" in joined:
+        return "tcmalloc"
+    if "je_" in joined or "jemalloc" in joined:
+        return "jemalloc"
+    if "mi_" in joined or "mimalloc" in joined:
+        return "mimalloc"
+    return "the allocator"
+
+
+def _allocator_finding(findings: list[Finding], views: list[View], busy: float) -> bool:
+    """Inclusive allocator time: malloc/free/new/delete plus everything they call.
+
+    Self time alone undercounts the allocator. Its locks, its unnamed static
+    functions, and the page faults it takes all sit below the entry point.
+    """
+    entries = category_entries(views, is_alloc)
+    if not entries:
+        return False
+    inclusive = sum(entry.busy for entry in entries)
+    if inclusive < ALLOC_INCLUSIVE * busy:
+        return False
+    names: set[str] = set()
+    named_self = 0.0
+    for entry in entries:
+        for view in iter_views(entry):
+            if view.busy_self > 0 and is_alloc(view.node.frame.name):
+                named_self += view.busy_self
+    # When the allocator's own named frames already explain its time, the self-time finding says it.
+    if inclusive - named_self < 0.03 * busy:
+        return False
+    spin = 0.0
+    user_spin = 0.0
+    kernel_lock = 0.0
+    kernel = 0.0
+    spin_name = ""
+    spin_by: dict[str, float] = {}
+    kernel_by: dict[str, float] = {}
+    for entry in entries:
+        for view in iter_views(entry):
+            names.add(view.node.frame.name)
+            if view.busy_self <= 0:
+                continue
+            if is_lock(view.node.frame.name):
+                spin += view.busy_self
+                if view.node.frame.kind == "kernel":
+                    kernel_lock += view.busy_self
+                else:
+                    user_spin += view.busy_self
+                    spin_by[view.node.frame.name] = spin_by.get(view.node.frame.name, 0.0) + view.busy_self
+            elif view.node.frame.kind == "kernel":
+                kernel += view.busy_self
+                if any(is_page_fault_entry(name) for name in view.path):
+                    area = "page faults"
+                else:
+                    target = frame_after_syscall(view.path)
+                    area = target if target else "interrupts and scheduler"
+                kernel_by[area] = kernel_by.get(area, 0.0) + view.busy_self
+    if spin_by:
+        spin_name = sorted(spin_by, key=lambda item: (-spin_by[item], item))[0]
+    callers: dict[str, float] = {}
+    for entry in entries:
+        caller = caller_name(entry, is_alloc)
+        callers[caller] = callers.get(caller, 0.0) + entry.busy
+    family = allocator_family(names)
+    spin_views = [
+        view for entry in entries for view in iter_views(entry) if view.busy_self > 0 and is_lock(view.node.frame.name)
+    ]
+    if spin >= 0.02 * busy and spin_views:
+        hot = sorted(spin_views, key=lambda view: (-view.busy_self, -view.busy, path_text(view.path)))[0]
+    else:
+        hot = hottest_inside(entries)
+    top = sorted(entries, key=lambda item: (-item.busy, path_text(item.path)))[0]
+    steps: list[str] = []
+    if spin >= 0.02 * busy:
+        parts = []
+        if user_spin > 0:
+            parts.append(f"{share(user_spin, busy):.1f}% spinning in {short_symbol(spin_name, 80)}")
+        if kernel_lock > 0:
+            parts.append(f"{share(kernel_lock, busy):.1f}% in the kernel futex and spinlock path behind it")
+        steps.append(
+            f"{share(spin, busy):.1f}% is lock contention inside {family}: {', '.join(parts)}. "
+            "Threads are fighting over the allocator's shared free lists, not over application data."
+        )
+    if kernel >= 0.02 * busy:
+        areas = sorted(kernel_by.items(), key=lambda item: (-item[1], item[0]))[:3]
+        listed = ", ".join(f"{name} ({share(value, busy):.1f}%)" for name, value in areas)
+        steps.append(f"{share(kernel, busy):.1f}% is other kernel time under the allocator: {listed}.")
+    ranked_callers = sorted(callers.items(), key=lambda item: (-item[1], item[0]))[:3]
+    caller_text = ", ".join(f"{short_symbol(name, 80)} ({share(value, busy):.1f}%)" for name, value in ranked_callers)
+    covered = sum(value for _name, value in ranked_callers)
+    if covered < 0.5 * inclusive:
+        steps.append(
+            f"cut the allocation rate. No single caller dominates: the top three ({caller_text}) cover "
+            f"{share(covered, inclusive):.0f}% of the allocator time, from {len(callers)} callers. "
+            "The cost is the allocation rate of the whole request path, not one function."
+        )
+    else:
+        steps.append(f"cut the allocation rate in the callers: {caller_text}.")
+    if family == "tcmalloc":
+        if any(view.node.frame.name.startswith(("mongo::", "__wt_")) for view in views):
+            steps.append(
+                "mongod uses tcmalloc. Compare db.serverStatus().tcmalloc between two samples: "
+                "per-CPU cache size, central free list and page heap activity. "
+                "Growth in the central or transfer caches matches lock spinning here."
+            )
+        else:
+            steps.append("check the tcmalloc stats for per-CPU cache and central free list activity.")
+    add_finding(
+        findings,
+        Finding(
+            pct=share(inclusive, busy),
+            key="alloc:inclusive",
+            title=f"memory allocation ({family}) is {share(inclusive, busy):.1f}% of inclusive time",
+            path=path_text((hot or top).path),
+            steps=steps,
+        ),
+    )
+    return True
+
+
 def _kernel_finding(findings: list[Finding], views: list[View], busy: float) -> None:
-    kernel_views = [view for view in views if view.node.frame.kind == "kernel" and view.busy_self > 0]
+    all_kernel = [view for view in views if view.node.frame.kind == "kernel" and view.busy_self > 0]
+    # perf re-arming its counters is measurement overhead. It is reported apart, not as a kernel problem.
+    kernel_views = [view for view in all_kernel if strip_symbol(view.node.frame.name) not in PERF_OVERHEAD]
     kern_self = sum(view.busy_self for view in kernel_views)
-    if kern_self < KERNEL_SELF * busy:
+    if kern_self < KERNEL_SELF * busy or not kernel_views:
+        if not kernel_views and all_kernel:
+            overhead = sum(view.busy_self for view in all_kernel)
+            if overhead >= KERNEL_SELF * busy:
+                hot = sorted(all_kernel, key=lambda view: (-view.busy_self, -view.busy, path_text(view.path)))[0]
+                add_finding(
+                    findings,
+                    Finding(
+                        pct=share(overhead, busy),
+                        key=f"kernel:{hot.node.frame.name}",
+                        title=f"perf overhead is {share(overhead, busy):.1f}% of self time",
+                        path=path_text(hot.path),
+                        steps=[
+                            f"{hot.node.frame.name} is perf turning the counter back on during a context switch. "
+                            "That time is not spent in the application."
+                        ],
+                    ),
+                )
         return
 
     def bucket(view: View) -> str:
@@ -1310,36 +1788,54 @@ def _kernel_finding(findings: list[Finding], views: list[View], busy: float) -> 
     )
 
 
-def _unknown_finding(findings: list[Finding], views: list[View], busy: float, comms: set[str]) -> None:
-    unknown_views = [view for view in views if view.depth > 0 and is_unknown(view.node.frame.name) and view.busy > 0]
+def _unknown_finding(
+    findings: list[Finding],
+    views: list[View],
+    busy: float,
+    comms: set[str],
+    unattributed: float = 0.0,
+    modules: dict[str, float] | None = None,
+) -> None:
+    """Raise missing symbols only for unnamed time that has no named caller.
+
+    Unnamed frames under a named function are counted with that function, so a
+    stripped static helper inside tcmalloc or WiredTiger does not hide the profile.
+    """
+    modules = modules or {}
+    unknown_views = [
+        view for view in views
+        if view.depth > 0 and is_unknown(view.node.frame.name) and view.busy > 0 and named_owner(view) is None
+    ]
     if not unknown_views:
         return
-    self_sum = sum(view.busy_self for view in unknown_views)
-    entries = category_entries(views, is_unknown)
-    widest = max((entry.busy for entry in entries), default=0.0)
-    trigger = max(self_sum, widest)
-    if trigger < UNKNOWN_SHARE * busy:
+    # A wide [unknown] band is harmless when named frames above it explain the time.
+    # What matters is self time that ends in unnamed code with no named caller.
+    if unattributed < UNKNOWN_SHARE * busy:
         return
-    if widest >= self_sum and entries:
-        chosen = sorted(entries, key=lambda view: (-view.busy, path_text(view.path)))[0]
-        samples = chosen.busy
-        word = "inclusive time"
-    else:
-        chosen = sorted(
-            [view for view in unknown_views if view.busy_self > 0] or unknown_views,
-            key=lambda view: (-view.busy_self, -view.busy, path_text(view.path)),
-        )[0]
-        samples = self_sum
-        word = "self time"
+    chosen = sorted(
+        [view for view in unknown_views if view.busy_self > 0] or unknown_views,
+        key=lambda view: (-view.busy_self, -view.busy, path_text(view.path)),
+    )[0]
+    samples = unattributed
+    word = "self time"
     name = chosen.node.frame.name
+    steps = [unknown_step(name, comms)]
+    if len(modules) > 1:
+        listed = ", ".join(f"{module} ({share(value, busy):.1f}%)" for module, value in
+                           sorted(modules.items(), key=lambda item: (-item[1], item[0]))[:4])
+        steps.append(f"unnamed self time by module: {listed}.")
     add_finding(
         findings,
         Finding(
             pct=share(samples, busy),
             key=name,
-            title=f"{name} is {share(samples, busy):.1f}% of {word}",
+            title=(
+                f"{name} is {share(samples, busy):.1f}% of {word}"
+                if len(modules) <= 1
+                else f"[unknown] code is {share(samples, busy):.1f}% of {word}, most of it in {name}"
+            ),
             path=path_text(chosen.path),
-            steps=[unknown_step(name, comms)],
+            steps=steps,
         ),
     )
 
@@ -1351,7 +1847,8 @@ def _deep_finding(findings: list[Finding], views: list[View], busy: float) -> No
             continue
         if view.busy_self < DEEP_SHARE * busy:
             continue
-        meaningful = [name for name in view.path if not is_interpreter(name)]
+        # [unknown] is many different addresses under one name. Its repeats are not recursion.
+        meaningful = [name for name in view.path if not is_interpreter(name) and not is_unknown(name)]
         counts: dict[str, int] = {}
         for name in meaningful:
             counts[name] = counts.get(name, 0) + 1
@@ -1415,8 +1912,18 @@ def _spread_finding(views: list[View], busy: float) -> Finding | None:
     )
 
 
+def sample_line(report: Report) -> str:
+    count = report.sample_count or report.total
+    if report.weight == "period":
+        event = ", ".join(report.events) if report.events else "the sampled event"
+        return f"{fmt_num(count)} samples, weighted by event count ({event})"
+    if report.weight == "folded":
+        return f"{fmt_num(report.total)} weight in {fmt_num(count)} folded stacks"
+    return f"{fmt_num(count)} samples"
+
+
 def render_report(report: Report) -> str:
-    lines = ["Flame report", f"{fmt_num(report.total)} samples", "", *HOW_TO, "", "Where the samples went"]
+    lines = ["Flame report", sample_line(report), "", *HOW_TO, "", "Where the samples went"]
     if report.idle > 0 and report.total > 0:
         lines.append(
             f"  {'idle':<8} {share(report.idle, report.total):5.1f}%  ({report.idle_label}, excluded below)"
@@ -1425,7 +1932,7 @@ def render_report(report: Report) -> str:
         lines.append("  all samples are idle")
     else:
         if report.idle > 0:
-            lines.append(f"Percentages below are of the {fmt_num(report.busy)} samples that are not idle.")
+            lines.append(f"Percentages below are of the {share(report.busy, report.total):.1f}% of the profile that is not idle.")
         lines.append(f"  {'user':<8} {share(report.user_self, report.busy):5.1f}%")
         lines.append(f"  {'kernel':<8} {share(report.kernel_self, report.busy):5.1f}%")
         if report.no_comm:
@@ -1454,6 +1961,12 @@ def render_report(report: Report) -> str:
             lines.append(f"   Path: {finding.path}")
             for step in finding.steps:
                 lines.append(f"   Next: {step}")
+    notes = profile_notes(report)
+    if notes:
+        lines.append("")
+        lines.append("Notes")
+        for item in notes:
+            lines.append(f"  - {item}")
     lines.append("")
     return "\n".join(lines)
 
@@ -1470,20 +1983,43 @@ def _unknown_module(name: str) -> str:
     return name[len("[unknown]"):].strip()
 
 
+def profile_notes(report: Report) -> list[str]:
+    """Notes on how to read the numbers: unnamed code, perf overhead, weighting."""
+    busy = report.busy if report.busy > 0 else report.total
+    unusual: list[str] = []
+    attributed = report.unknown_self - report.unknown_unattributed
+    if busy and attributed >= 0.05 * busy and report.unknown_owners:
+        owners = ", ".join(
+            f"{short_symbol(name, 80)} ({share(value, busy):.1f}%)" for name, value in report.unknown_owners[:3]
+        )
+        unusual.append(
+            f"{share(attributed, busy):.1f}% of self time is in functions with no symbol. "
+            f"It is counted under the named function that called them: {owners}. "
+            "Debug symbols for the binary would name the exact function."
+        )
+    if busy and report.perf_overhead >= PERF_NOTE * busy:
+        unusual.append(
+            f"{share(report.perf_overhead, busy):.1f}% of the profile is perf itself re-arming its counters "
+            "(native_write_msr, perf_adjust_freq_unthr_context). It is measurement overhead, not the application."
+        )
+    if report.weight == "period":
+        unusual.append(
+            "Percentages are weighted by event count (the period on each sample), as perf report does. "
+            "Use --weight samples to count every sample as one."
+        )
+    return unusual
+
+
 def conclusion_points(report: Report) -> tuple[list[str], list[str], list[str]]:
     """What is wrong, how to fix it, and what looks unusual. Grounded in this profile."""
     busy = report.busy if report.busy > 0 else report.total
     wrong: list[str] = []
     fix: list[str] = []
     unusual: list[str] = []
-    unknown_names: list[str] = []
-    for samples, name, _path in list(report.widest) + list(report.hottest):
-        if name.startswith("[unknown]") and name not in unknown_names:
-            unknown_names.append(name)
-    unknown_finding = next((item for item in report.findings if "[unknown]" in item.title), None)
-    modules = [_unknown_module(name) for name in unknown_names]
+    unknown_finding = next((item for item in report.findings if item.title.startswith("[unknown]")), None)
+    modules = list(report.unknown_modules)
     libc_unknown = any("libc" in module or "libpthread" in module or module.startswith("ld-") for module in modules)
-    kernel_unknown = any("kernel" in module or module == "[kernel.kallsyms]" for module in modules)
+    kernel_unknown = any("kernel" in module for module in modules)
 
     if unknown_finding is not None:
         wrong.append(
@@ -1502,12 +2038,12 @@ def conclusion_points(report: Report) -> tuple[list[str], list[str], list[str]]:
             "If the new stacks are still one frame deep, use --call-graph dwarf, or a binary built with frame pointers."
         )
         fix.append("Do not tune queries, indexes, or configuration from this graph. There is no named function to change yet.")
-    if libc_unknown:
+    if libc_unknown and unknown_finding is not None:
         unusual.append(
             "libc and the threading library are unnamed too. A stripped application usually still shows libc names "
             "such as malloc or pthread_mutex_lock. Here symbol lookup failed for the whole capture, not just the server binary."
         )
-    if kernel_unknown:
+    if kernel_unknown and unknown_finding is not None:
         unusual.append(
             "Kernel frames are also [unknown]. perf could not read kernel symbols, so this is not only a missing application package."
         )
@@ -1516,6 +2052,8 @@ def conclusion_points(report: Report) -> tuple[list[str], list[str], list[str]]:
             f"Kernel time is only {share(report.kernel_self, busy):.1f}%. "
             "This is not a kernel or interrupt problem. The samples are inside the server, with the names missing."
         )
+
+    unusual.extend(profile_notes(report))
 
     for name, samples in report.processes:
         pct = share(samples, busy) if busy else 0
@@ -1527,7 +2065,7 @@ def conclusion_points(report: Report) -> tuple[list[str], list[str], list[str]]:
             unusual.append(f"{name} alone is {pct:.1f}% of on-CPU time, which is a large share for a single thread.")
 
     for finding in report.findings:
-        if "[unknown]" in finding.title:
+        if finding is unknown_finding:
             continue
         wrong.append(finding.title + ".")
         for step in finding.steps:
@@ -1544,7 +2082,7 @@ def conclusion_points(report: Report) -> tuple[list[str], list[str], list[str]]:
     return wrong, fix, unusual
 
 
-def render_html(report: Report, svg_markup: str) -> str:
+def render_html(report: Report, svg_markup: str, icicle: bool = False) -> str:
     busy = report.busy if report.busy > 0 else report.total
     user_pct = share(report.user_self, busy) if busy else 0
     kern_pct = share(report.kernel_self, busy) if busy else 0
@@ -1665,12 +2203,13 @@ def render_html(report: Report, svg_markup: str) -> str:
   h1 {{ margin: 0 0 8px; font-size: 40px; line-height: 1.1; font-weight: 600; }}
   h2 {{ margin: 0 0 12px; font-size: 22px; }}
   .verdict {{ font-size: 22px; margin: 0 0 18px; }}
-  .mix {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 18px 0 8px; }}
-  .mix div {{ background: var(--card); border: 1px solid var(--line); padding: 12px 14px; }}
+  .mix {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin: 18px 0 8px; }}
+  .mix > div {{ background: var(--card); border: 1px solid var(--line); padding: 12px 14px; }}
   .mix strong {{ display: block; font: 600 28px/1 ui-sans-serif, "Segoe UI", sans-serif; }}
-  .mix span {{ color: var(--muted); font: 13px/1.3 ui-sans-serif, "Segoe UI", sans-serif; }}
+  .mix > div > span {{ display: block; margin-bottom: 6px; color: var(--muted); font: 13px/1.3 ui-sans-serif, "Segoe UI", sans-serif; }}
   section {{ margin: 28px 0; }}
   .cards {{ display: grid; gap: 12px; }}
+  .card, .conclusion li, .card p {{ overflow-wrap: anywhere; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--line);
@@ -1695,7 +2234,7 @@ def render_html(report: Report, svg_markup: str) -> str:
     font: 13px/1 ui-sans-serif, sans-serif;
   }}
   button:hover {{ background: var(--accent); color: white; }}
-  .thread {{ display: grid; grid-template-columns: 220px 1fr 52px; gap: 10px; align-items: center; margin: 6px 0; }}
+  .thread {{ display: grid; grid-template-columns: 220px minmax(0, 1fr) 52px; gap: 10px; align-items: center; margin: 6px 0; }}
   .thread-name, .thread-pct {{ font: 13px/1.2 ui-sans-serif, sans-serif; }}
   .track {{ height: 10px; background: #efe8dc; }}
   .fill {{ display: block; height: 100%; }}
@@ -1704,11 +2243,13 @@ def render_html(report: Report, svg_markup: str) -> str:
   #stage {{
     overflow: auto; max-height: 78vh; border: 1px solid var(--line); background: #f6f6f6;
   }}
-  table {{ width: 100%; border-collapse: collapse; background: var(--card); }}
+  table {{ width: 100%; border-collapse: collapse; background: var(--card); table-layout: fixed; }}
+  th:first-child, td:first-child {{ width: 72px; }}
+  td {{ overflow-wrap: anywhere; }}
   th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }}
   th {{ font: 600 12px/1.2 ui-sans-serif, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }}
   .note {{ color: var(--muted); }}
-  .conclusion {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }}
+  .conclusion {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
   .conclusion div {{ background: var(--card); border: 1px solid var(--line); padding: 14px 16px; }}
   .conclusion h3 {{ margin: 0 0 8px; font-size: 16px; }}
   .conclusion ul, .conclusion ol {{ margin: 0; padding-left: 18px; }}
@@ -1725,7 +2266,8 @@ def render_html(report: Report, svg_markup: str) -> str:
 <body>
 <header>
   <p class="kicker">CPU flame report</p>
-  <h1>{escape(fmt_num(report.total))} on-CPU samples</h1>
+  <h1>{escape(fmt_num(report.sample_count or report.total))} on-CPU samples</h1>
+  <p class="note">{escape(sample_line(report))}</p>
   <p class="verdict">{escape(verdict)}</p>
   <p>Each frame's width is time the CPU was in that function, including everything it called. The bottom row is the root. Start with the widest frames. Self time is the part of a frame not covered by its children. That is where the CPU actually was.</p>
   {idle_note}
@@ -1753,6 +2295,13 @@ def render_html(report: Report, svg_markup: str) -> str:
     </p>
     <p class="note">Click a frame to zoom. Type to search. Esc clears. Reset zoom is at the top of the graph.</p>
     <div id="stage">{svg_embedded(svg_markup)}</div>
+    <script>
+      // The root is the bottom row. Start the view there, where the graph begins.
+      (function () {{
+        var stage = document.getElementById("stage");
+        if (stage && !{str(icicle).lower()}) stage.scrollTop = stage.scrollHeight;
+      }})();
+    </script>
   </section>
   <section>
     <h2>Widest frames</h2>
@@ -1880,12 +2429,12 @@ def fmt_num(value: float) -> str:
     return f"{int(round(value)):,}"
 
 
-def tip(box: Box, root_samples: float) -> str:
+def tip(box: Box, root_samples: float, unit: str = "samples") -> str:
     total = 100.0 * box.samples / root_samples if root_samples else 0
     parent = 100.0 * box.samples / box.parent_samples if box.parent_samples else 100
     self_pct = 100.0 * box.self_samples / root_samples if root_samples else 0
     return (
-        f"{box.name} — {fmt_num(box.samples)} samples, "
+        f"{box.name} — {fmt_num(box.samples)} {unit}, "
         f"{total:.1f}% of total, {parent:.1f}% of parent, "
         f"self {fmt_num(box.self_samples)} ({self_pct:.1f}%)"
     )
@@ -1898,7 +2447,17 @@ def fit_title(title: str, width: int) -> str:
     return title[: max_chars - 1] + "…"
 
 
-def write_svg(path: str, boxes: list[Box], root_samples: float, title: str, width: int) -> None:
+def weight_unit(root: Node) -> str:
+    meta = root.meta or {}
+    if meta.get("weight") == "period":
+        events = meta.get("events") or []
+        return (events[0] if len(events) == 1 else "events") + " (event count)"
+    if meta.get("weight") == "folded":
+        return "weight"
+    return "samples"
+
+
+def write_svg(path: str, boxes: list[Box], root_samples: float, title: str, width: int, unit: str = "samples") -> str:
     max_depth = max(box.depth for box in boxes)
     height = HEADER + (max_depth + 1) * FRAME_H + BOTTOM
     plot = width - 2 * XPAD
@@ -1926,7 +2485,7 @@ def write_svg(path: str, boxes: list[Box], root_samples: float, title: str, widt
         '<text id="details" x="10" y="46" fill="#333">Hover a frame for samples and percentages.</text>\n',
         '<text id="searchlabel" x="10" y="66" fill="#555">Type to search. Click a frame to zoom. Esc clears.</text>\n',
     ]
-    for box in chunks_boxes(boxes, root_samples):
+    for box in chunks_boxes(boxes, root_samples, unit):
         chunks.append(box)
     chunks.append("</svg>\n")
     markup = "".join(chunks)
@@ -1938,13 +2497,13 @@ def write_svg(path: str, boxes: list[Box], root_samples: float, title: str, widt
     return markup
 
 
-def chunks_boxes(boxes: list[Box], root_samples: float) -> list[str]:
+def chunks_boxes(boxes: list[Box], root_samples: float, unit: str = "samples") -> list[str]:
     rows: list[str] = []
     for box in boxes:
         fill = color_for(box.name, box.kind)
         hidden = ' style="display:none"' if box.width < 36 else ""
         label = escape(box.name)
-        detail = escape(tip(box, root_samples), quote=True)
+        detail = escape(tip(box, root_samples, unit), quote=True)
         name_attr = escape(box.name, quote=True)
         rows.append(
             f'<g class="frame" id="{box.id}" data-name="{name_attr}" data-fill="{fill}" '
@@ -1968,13 +2527,17 @@ def emit(path: str, root: Node, title: str, width: int, min_width: float, icicle
     if root.samples <= 0:
         raise SystemExit("No samples to draw.")
     boxes = layout(root, width, min_width, icicle)
-    write_svg(path, boxes, root.samples, title, width)
+    write_svg(path, boxes, root.samples, title, width, weight_unit(root))
     hidden = count_nodes(root) - len(boxes)
     extra = ""
     if hidden:
         extra = f" ({hidden} narrower than --min-width {min_width:g}px were left out)"
     print(f"Wrote {os.path.abspath(path)}")
-    print(f"{fmt_num(root.samples)} samples, {len(boxes)} frames{extra}")
+    meta = root.meta or {}
+    if meta.get("weight") == "period":
+        print(f"{fmt_num(meta.get('sample_count', 0))} samples weighted by event count, {len(boxes)} frames{extra}")
+    else:
+        print(f"{fmt_num(root.samples)} samples, {len(boxes)} frames{extra}")
     kinds = {box.kind for box in boxes}
     legend = []
     if "comm" in kinds:
@@ -2106,8 +2669,8 @@ def record_command(
     cmd = [
         "perf", "record",
         "-F", str(freq),
+        # --call-graph already turns call graphs on. A later -g can reset the unwinder to frame pointers.
         "--call-graph", mode,
-        "-g",
         "--no-buildid-mmap",
         "-o", data_path,
     ]
@@ -2164,7 +2727,13 @@ def run_and_draw(
         text = record_script(cmd, keep, want_script=not record_only)
     if record_only:
         return
-    root = load_perf_script(text, include_comm=not args.no_comm, comm_filter=set(args.comm))
+    root = load_perf_script(
+        text,
+        include_comm=not args.no_comm,
+        comm_filter=set(args.comm),
+        weight=args.weight,
+        per_thread=args.per_thread,
+    )
     emit(args.output, root, title, args.width, args.min_width, args.icicle, args.open)
     if not getattr(args, "no_report", False):
         publish_report(root, args.top, args.report or default_report_path(args.output))
@@ -2205,6 +2774,54 @@ def cmd_system(args: argparse.Namespace) -> None:
     run_and_draw(args, ["sleep", f"{args.duration:g}"], None, True, title)
 
 
+COMPRESSED = (
+    (b"\x1f\x8b", "gzip"),
+    (b"BZh", "bzip2"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
+)
+
+
+def decompress(path: str, kind: str) -> bytes:
+    """Read a .gz, .bz2, .xz, or .zst file. zstd needs the zstandard module or the zstd command."""
+    if kind == "gzip":
+        import gzip
+
+        with gzip.open(path, "rb") as handle:
+            return handle.read()
+    if kind == "bzip2":
+        import bz2
+
+        with bz2.open(path, "rb") as handle:
+            return handle.read()
+    if kind == "xz":
+        import lzma
+
+        with lzma.open(path, "rb") as handle:
+            return handle.read()
+    try:
+        import zstandard  # type: ignore[import-not-found]
+
+        with open(path, "rb") as handle:
+            return zstandard.ZstdDecompressor().stream_reader(handle).read()
+    except ImportError:
+        pass
+    if shutil.which("zstd") is None:
+        raise SystemExit(f"{path} is zstd-compressed. Install zstd, or run: zstd -d {shlex.quote(path)}")
+    proc = subprocess.run(["zstd", "-dc", path], capture_output=True)
+    if proc.returncode != 0:
+        raise SystemExit(proc.stderr.decode(errors="replace").strip() or "zstd failed")
+    return proc.stdout
+
+
+def perf_script_of(path: str) -> str:
+    require_perf()
+    script = subprocess.run(["perf", "script", "-i", path], text=True, capture_output=True)
+    if script.returncode != 0:
+        raise SystemExit((script.stderr or "perf script failed").strip())
+    return script.stdout
+
+
 def read_graph_input(path: str) -> str:
     if path == "-":
         return sys.stdin.read()
@@ -2213,18 +2830,35 @@ def read_graph_input(path: str) -> str:
     with open(path, "rb") as handle:
         magic = handle.read(8)
     if magic.startswith(b"PERFILE"):
-        require_perf()
-        script = subprocess.run(["perf", "script", "-i", path], text=True, capture_output=True)
-        if script.returncode != 0:
-            raise SystemExit((script.stderr or "perf script failed").strip())
-        return script.stdout
+        return perf_script_of(path)
+    for prefix, kind in COMPRESSED:
+        if magic.startswith(prefix):
+            data = decompress(path, kind)
+            if data.startswith(b"PERFILE"):
+                with tempfile.TemporaryDirectory(prefix="cpuflame-") as temp_dir:
+                    raw = os.path.join(temp_dir, "perf.data")
+                    with open(raw, "wb") as handle:
+                        handle.write(data)
+                    return perf_script_of(raw)
+            return data.decode("utf-8", errors="replace")
     with open(path, encoding="utf-8", errors="replace") as handle:
         return handle.read()
 
 
+def load_args(text: str, args: argparse.Namespace) -> Node:
+    return load_text(
+        text,
+        args.format,
+        include_comm=not args.no_comm,
+        comm_filter=set(args.comm),
+        weight=args.weight,
+        per_thread=args.per_thread,
+    )
+
+
 def cmd_graph(args: argparse.Namespace) -> None:
     text = read_graph_input(args.input)
-    root = load_text(text, args.format, include_comm=not args.no_comm, comm_filter=set(args.comm))
+    root = load_args(text, args)
     title = args.title or "Flame graph"
     emit(args.output, root, title, args.width, args.min_width, args.icicle, args.open)
 
@@ -2263,7 +2897,7 @@ def cmd_example(args: argparse.Namespace) -> None:
 def cmd_report(args: argparse.Namespace) -> None:
     validate_top(args.top)
     text = read_graph_input(args.input)
-    root = load_text(text, args.format, include_comm=not args.no_comm, comm_filter=set(args.comm))
+    root = load_args(text, args)
     publish_report(root, args.top, args.output or None)
 
 
@@ -2272,12 +2906,12 @@ def cmd_html(args: argparse.Namespace) -> None:
     if args.width < 240:
         raise SystemExit("--width must be at least 240")
     text = read_graph_input(args.input)
-    root = load_text(text, args.format, include_comm=not args.no_comm, comm_filter=set(args.comm))
+    root = load_args(text, args)
     title = args.title or "CPU flame report"
     boxes = layout(root, args.width, args.min_width, args.icicle)
     svg_path = os.path.splitext(args.output)[0] + ".svg"
-    markup = write_svg(svg_path, boxes, root.samples, title, args.width)
-    page = render_html(analyze(root, args.top), markup)
+    markup = write_svg(svg_path, boxes, root.samples, title, args.width, weight_unit(root))
+    page = render_html(analyze(root, args.top), markup, icicle=args.icicle)
     parent = os.path.dirname(os.path.abspath(args.output))
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -2631,7 +3265,10 @@ other 8 [001] 10.530000:          1 cpu-clock:
     recorded = record_command(99, "fp", "perf.data", "123,456", False, ["sleep", "60"], all_cpus=True)
     expect(recorded[recorded.index("-a") + 0] == "-a", "attach capture is missing -a")
     expect(recorded[recorded.index("-p") + 1] == "123,456", "attach capture did not keep every pid")
-    expect(recorded[recorded.index("-g") + 0] == "-g", "attach capture is missing -g")
+    expect(recorded[recorded.index("--call-graph") + 1] == "fp", "attach capture is missing the call graph")
+    expect("-g" not in recorded, "-g after --call-graph can override the unwinder")
+    dwarf = record_command(99, "dwarf", "perf.data", "1", False, ["sleep", "1"])
+    expect(dwarf[dwarf.index("--call-graph") + 1] == "dwarf,8192" and "-g" not in dwarf, "dwarf unwinder was not kept")
     expect("99" in recorded, "attach capture is missing -F 99")
     expect(is_lock("absl::lts_20230802::base_internal::SpinLock::SpinLoop()"), "abseil spin was missed")
     repeated = Node(Frame("all", "root"))
@@ -2679,6 +3316,83 @@ other 8 [001] 10.530000:          1 cpu-clock:
         expect("bar is 100.0% of self time" in written, "report command missed the leaf")
         expect(find_frame(load_folded("main;foo;bar 12\n", set(), True), "main").frame.kind == "user", "report input recolored main")
 
+    # perf script headers: padded comm, comm with spaces, hex-looking comm, period column.
+    padded = (
+        "         cc1  4242 [001] 20.000000:     1000 cycles:P: \n"
+        "\tffffffffc0a1b2c3 xfs_buf_find+0x10 ([xfs])\n"
+        "\tffffffff81001234 [unknown] ([unknown])\n"
+        "\t7ff1 main+0x5 (/usr/bin/cc1)\n"
+        "\n"
+        "GC Thread#0 77/78 [002] 20.100000:     3000 cycles:P: \n"
+        "\t7ff1 work+0x5 (/usr/lib/jvm/libjvm.so)\n"
+        "\n"
+    )
+    headed = load_perf_script(padded, include_comm=True, comm_filter=set())
+    expect(find_frame(headed, "cc1") is not None and find_frame(headed, "cc1").frame.kind == "comm", "padded hex comm read as a frame")
+    expect(find_frame(headed, "GC Thread#0") is not None, "comm with a space was cut at the space")
+    expect(headed.samples == 4000 and (headed.meta or {}).get("weight") == "period", "period weighting was not used")
+    expect(find_frame(headed, "xfs_buf_find").frame.kind == "kernel", "kernel module frame was drawn as user code")
+    expect(find_frame(headed, "[unknown] [unknown]").frame.kind == "kernel", "kernel address was drawn as user code")
+    counted = load_perf_script(padded, include_comm=True, comm_filter=set(), weight="samples")
+    expect(counted.samples == 2, "--weight samples did not count samples")
+
+    # perf's own re-arm (period 1) must not look like a kernel problem.
+    msr_script = ""
+    for index in range(60):
+        msr_script += (
+            f"conn{index % 3} 10 {30 + index / 100:.6f}:          1 cycles:P: \n"
+            "\tffffffff81000001 native_write_msr+0x6 ([kernel.kallsyms])\n"
+            "\tffffffff81000002 intel_pmu_enable_all+0x15 ([kernel.kallsyms])\n"
+            "\t7ff1 start_thread+0x1 (/usr/lib64/libc.so.6)\n\n"
+            f"conn{index % 3} 10 {30 + index / 100 + 0.001:.6f}:    1000000 cycles:P: \n"
+            "\t7ff1 do_query+0x6 (/usr/bin/app)\n"
+            "\t7ff1 start_thread+0x1 (/usr/lib64/libc.so.6)\n\n"
+        )
+    msr_tree = load_perf_script(msr_script, include_comm=True, comm_filter=set())
+    msr_report = render_report(analyze(msr_tree, 8))
+    expect("do_query is 100.0% of self time" in msr_report, "period weighting did not shrink perf overhead")
+    expect("kernel time is" not in msr_report, "perf overhead became a kernel finding")
+    expect("connections (3 threads)" in msr_report, "merged connection threads lost their count")
+    expect(find_frame(msr_tree, "conn*") is not None, "numbered threads were not merged")
+    by_count = render_report(analyze(load_perf_script(msr_script, True, set(), weight="samples"), 8))
+    expect("perf overhead is 50.0%" in by_count, "sample weighting did not flag perf overhead")
+    split = load_perf_script(msr_script, True, set(), per_thread=True)
+    expect(find_frame(split, "conn1") is not None and find_frame(split, "conn*") is None, "--per-thread merged threads")
+    lone = load_perf_script("worker1 1 [000] 1.000000: 5 cycles:\n\t7ff1 f+0x1 (/bin/a)\n", True, set())
+    expect(find_frame(lone, "worker1") is not None, "a single numbered thread was renamed")
+
+    # stackcollapse-perf output with no _[k] marks: comm first, [module] for unnamed frames.
+    collapsed = load_folded("conn12;[libpthread-2.28.so];[mongod];[[kernel.kallsyms]] 5\nconn13;[mongod] 20\n", set(), True)
+    expect(find_frame(collapsed, "conn*") is not None, "collapsed comm frame was not a process")
+    expect(find_frame(collapsed, "[unknown] mongod") is not None, "[mongod] was not read as an unnamed frame")
+    expect(find_frame(collapsed, "[unknown] [kernel.kallsyms]").frame.kind == "kernel", "[[kernel.kallsyms]] was not kernel")
+    collapsed_report = render_report(analyze(collapsed, 8))
+    expect("symbols are missing for mongod" in collapsed_report, "unnamed collapsed stacks were not flagged")
+    expect("optimize [mongod]" not in collapsed_report and "repeats" not in collapsed_report, "unnamed frames read as code")
+
+    # Unnamed static functions inside a named caller belong to that caller.
+    owned = stacked([
+        ([comm("conn*"), user("start_thread"), user("handle"), user("operator delete(void*)"),
+          user("tcmalloc::CpuCache::Deallocate"), user("[unknown] app"), user("absl::base_internal::SpinLock::SpinLoop()")], 30),
+        ([comm("conn*"), user("start_thread"), user("handle"), user("operator new(unsigned long)"),
+          user("tcmalloc::CpuCache::Refill"), user("[unknown] app")], 30),
+        ([comm("conn*"), user("start_thread"), user("handle"), user("scan")], 40),
+    ])
+    expect("symbols are missing" not in owned, "unnamed code under a named caller was called missing symbols")
+    expect("[unknown] in tcmalloc::CpuCache::Refill" in owned, "unnamed self time was not given its caller")
+    expect("memory allocation (tcmalloc) is 60.0% of inclusive time" in owned, "allocator inclusive time missed")
+    expect("lock contention inside tcmalloc" in owned, "allocator lock spin was not explained")
+    expect("the CPU is spinning in" not in owned, "allocator spin was also reported as an application lock")
+    expect("The caller is [unknown]" not in owned, "caller pointed at an unnamed frame")
+
+    import gzip as _gzip
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        packed = os.path.join(temp_dir, "perf.script.gz")
+        with _gzip.open(packed, "wt", encoding="utf-8") as handle:
+            handle.write(script)
+        expect("decode_utf8" in read_graph_input(packed), "gzip input was not read")
+
     page = render_html(analyze(example_tree(), 8), "<svg data-plot-width=\"1\"></svg>\n")
     expect("What is wrong" in page and "memcmp" in page and "<svg" in page, "html report is missing the graph or the finding")
     expect("Conclusion" in page and "What to do" in page and "Unusual" in page, "html report is missing the conclusion")
@@ -2718,6 +3432,18 @@ folded stacks look like:  main;foo;bar 12
     filt = argparse.ArgumentParser(add_help=False)
     filt.add_argument("--no-comm", action="store_true", help="Do not add the process name at the base of each stack")
     filt.add_argument("--comm", action="append", default=[], help="Keep only this process name (repeatable)")
+    filt.add_argument(
+        "--weight",
+        choices=["auto", "period", "samples"],
+        default="auto",
+        help="perf script input: weight each sample by its event count (period, what perf report uses) "
+        "or count every sample as 1. auto uses period when every sample has one (default: auto)",
+    )
+    filt.add_argument(
+        "--per-thread",
+        action="store_true",
+        help="Keep numbered threads apart (conn1, conn2). By default they merge into conn* so the same code path is one tower",
+    )
 
     record = argparse.ArgumentParser(add_help=False)
     record.add_argument("-F", "--freq", type=int, default=99, help="Samples per second (default: 99)")
