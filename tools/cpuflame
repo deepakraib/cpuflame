@@ -10,6 +10,7 @@ hot frames and what to try next.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import re
 import shlex
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import typing
 import zlib
 from dataclasses import dataclass
 from html import escape
@@ -291,8 +293,24 @@ def frame_address(line: str) -> int | None:
         return None
 
 
+_FRAME_CACHE: dict[tuple[str, bool], Frame] = {}
+
+
 def parse_frame(line: str) -> Frame:
+    """Parse one stack line. The text after the address repeats a lot, so it is cached."""
     address = frame_address(line)
+    match = ADDR_RE.match(line)
+    rest = line[match.end():] if match else line
+    key = (rest, address is not None and address >= KERNEL_ADDR)
+    frame = _FRAME_CACHE.get(key)
+    if frame is None:
+        frame = _parse_frame(line, address)
+        if len(_FRAME_CACHE) < 2_000_000:
+            _FRAME_CACHE[key] = frame
+    return frame
+
+
+def _parse_frame(line: str, address: int | None) -> Frame:
     match = MODULE_RE.match(line)
     if match:
         return tidy(match.group(1), match.group(2), address)
@@ -300,6 +318,29 @@ def parse_frame(line: str) -> Frame:
     if match:
         return tidy(match.group(1), "", address)
     return Frame("[unparsed]", "user")
+
+
+class InputFile:
+    """A text input read line by line from disk, so a 1 GB perf script is never held in memory."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def lines(self):
+        with open(self.path, encoding="utf-8", errors="replace", newline="") as handle:
+            for line in handle:
+                yield line.rstrip("\r\n")
+
+    def read(self) -> str:
+        with open(self.path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+
+
+def lines_of(text) -> "typing.Iterator[str]":
+    """Lines of a str or an InputFile, without line endings."""
+    if isinstance(text, InputFile):
+        return text.lines()
+    return iter(text.splitlines())
 
 
 @dataclass
@@ -362,13 +403,13 @@ def thread_merge_map(comms) -> tuple[dict[str, str], dict[str, int]]:
     return mapping, counts
 
 
-def scan_headers(text: str) -> tuple[set[str], bool, list[str]]:
+def scan_headers(text) -> tuple[set[str], bool, list[str]]:
     """First pass over perf script text: thread names, whether every header has a period, events."""
     comms: set[str] = set()
     events: set[str] = set()
     every_period = True
     seen = False
-    for line in text.splitlines():
+    for line in lines_of(text):
         if not line or line.startswith("#") or line[:1] == "\t":
             continue
         if not TS_RE.search(line):
@@ -394,7 +435,7 @@ def add_sample(root: Node, frames: list[Frame], weight: float) -> None:
 
 
 def load_perf_script(
-    text: str,
+    text,
     include_comm: bool,
     comm_filter: set[str],
     weight: str = "auto",
@@ -443,7 +484,7 @@ def load_perf_script(
         count += 1
         add_sample(root, stack, (header.period or 0) if use_period else 1)
 
-    for line in text.splitlines():
+    for line in lines_of(text):
         if not line.strip() or line.startswith("#"):
             if not line.strip() and current is not None:
                 flush()
@@ -490,9 +531,9 @@ def split_folded_name(name: str) -> tuple[str, str | None]:
     return name[: match.start()].strip(), match.group(1)
 
 
-def folded_has_marks(text: str) -> bool:
+def folded_has_marks(text) -> bool:
     """True when the file uses stackcollapse suffixes such as _[k]."""
-    for line in text.splitlines():
+    for line in lines_of(text):
         if not line.strip() or line.startswith("#"):
             continue
         match = FOLDED_RE.match(line)
@@ -504,10 +545,10 @@ def folded_has_marks(text: str) -> bool:
     return False
 
 
-def folded_is_collapsed(text: str) -> bool:
+def folded_is_collapsed(text) -> bool:
     """stackcollapse-perf output without _[k] marks: frames such as [mongod] or [[kernel.kallsyms]]."""
     checked = 0
-    for line in text.splitlines():
+    for line in lines_of(text):
         if not line.strip() or line.startswith("#"):
             continue
         match = FOLDED_RE.match(line)
@@ -540,7 +581,7 @@ def folded_frame(part: str, mark: str | None, collapsed: bool) -> Frame:
     return Frame(base, "user")
 
 
-def load_folded(text: str, comm_filter: set[str], include_comm: bool = True, per_thread: bool = False) -> Node:
+def load_folded(text, comm_filter: set[str], include_comm: bool = True, per_thread: bool = False) -> Node:
     root = Node(Frame("all", "root"))
     skipped = 0
     count = 0
@@ -550,7 +591,7 @@ def load_folded(text: str, comm_filter: set[str], include_comm: bool = True, per
     marked = folded_has_marks(text)
     collapsed = marked or folded_is_collapsed(text)
     rows: list[tuple[list[str], str]] = []
-    for line in text.splitlines():
+    for line in lines_of(text):
         if not line.strip() or line.startswith("#"):
             continue
         match = FOLDED_RE.match(line)
@@ -604,9 +645,9 @@ def load_folded(text: str, comm_filter: set[str], include_comm: bool = True, per
     return root
 
 
-def detect_format(text: str) -> str:
+def detect_format(text) -> str:
     checked = 0
-    for line in text.splitlines():
+    for line in lines_of(text):
         if not line.strip() or line.startswith("#"):
             continue
         checked += 1
@@ -618,7 +659,7 @@ def detect_format(text: str) -> str:
 
 
 def load_text(
-    text: str,
+    text,
     fmt: str,
     include_comm: bool,
     comm_filter: set[str],
@@ -626,6 +667,8 @@ def load_text(
     per_thread: bool = False,
 ) -> Node:
     kind = detect_format(text) if fmt == "auto" else fmt
+    if kind != "script" and weight == "period":
+        print("Folded stacks carry their own counts. --weight period is ignored.", file=sys.stderr)
     if kind == "script":
         return load_perf_script(text, include_comm, comm_filter, weight=weight, per_thread=per_thread)
     return load_folded(text, comm_filter, include_comm, per_thread=per_thread)
@@ -804,6 +847,7 @@ HOW_TO = (
 )
 
 
+@functools.lru_cache(maxsize=None)
 def strip_symbol(symbol: str) -> str:
     text = symbol.strip()
     while True:
@@ -855,6 +899,7 @@ def exact_match(symbol: str, name: str) -> bool:
     return strip_symbol(symbol) == name
 
 
+@functools.lru_cache(maxsize=None)
 def matches_rules(symbol: str, rules: tuple[tuple[str, str], ...]) -> bool:
     for name, mode in rules:
         if mode == "exact" and exact_match(symbol, name):
@@ -866,6 +911,7 @@ def matches_rules(symbol: str, rules: tuple[tuple[str, str], ...]) -> bool:
     return False
 
 
+@functools.lru_cache(maxsize=None)
 def is_alloc(name: str) -> bool:
     text = strip_symbol(name)
     if text.startswith("operator new") or text.startswith("operator delete"):
@@ -877,10 +923,12 @@ def is_alloc(name: str) -> bool:
     return matches_rules(text, ALLOC_RULES)
 
 
+@functools.lru_cache(maxsize=None)
 def is_copy(name: str) -> bool:
     return matches_rules(name, COPY_RULES)
 
 
+@functools.lru_cache(maxsize=None)
 def is_lock(name: str) -> bool:
     text = strip_symbol(name)
     if text.startswith("rw_lock_") and "_spin" in text:
@@ -890,10 +938,12 @@ def is_lock(name: str) -> bool:
     return matches_rules(text, LOCK_RULES)
 
 
+@functools.lru_cache(maxsize=None)
 def is_page_fault_entry(name: str) -> bool:
     return strip_symbol(name) in PAGE_FAULT_ENTRIES
 
 
+@functools.lru_cache(maxsize=None)
 def is_syscall_entry(name: str) -> bool:
     return strip_symbol(name) in SYSCALL_ENTRIES
 
@@ -1015,6 +1065,11 @@ def short_symbol(name: str, limit: int = 72) -> str:
 
 
 def path_text(names: tuple[str, ...] | list[str]) -> str:
+    return _path_text(tuple(names))
+
+
+@functools.lru_cache(maxsize=200_000)
+def _path_text(names: tuple[str, ...]) -> str:
     shown = [short_symbol(name) for name in names]
     if len(shown) > 8:
         shown = [shown[0], "…", *shown[-4:]]
@@ -1445,7 +1500,7 @@ def _collect_findings(
         if part <= 0:
             return []
         return [
-            f"{share(part, busy):.1f}% of it is in unnamed code that {name} calls "
+            f"{share(part, busy):.1f} of those {share(by_name[name], busy):.1f} points are unnamed code that {name} calls "
             "(static or inlined functions with no symbol). Install debug symbols to name them."
         ]
 
@@ -2616,7 +2671,7 @@ def perf_data_beside(svg_path: str) -> str:
     return svg_path + ".perf.data"
 
 
-def record_script(record_cmd: list[str], keep_path: str | None, want_script: bool = True) -> str:
+def record_script(record_cmd: list[str], keep_path: str | None, want_script: bool = True) -> "InputFile | str":
     require_perf()
     print("Running " + " ".join(shlex.quote(part) for part in record_cmd))
     proc = subprocess.run(record_cmd, text=True, capture_output=True)
@@ -2638,8 +2693,10 @@ def record_script(record_cmd: list[str], keep_path: str | None, want_script: boo
                 file=sys.stderr,
             )
         return ""
-    script = subprocess.run(["perf", "script", "-i", data_path], text=True, capture_output=True)
-    if script.returncode != 0 or not script.stdout.strip():
+    out = temp_path("perf.script")
+    with open(out, "w", encoding="utf-8") as handle:
+        script = subprocess.run(["perf", "script", "-i", data_path], stdout=handle, stderr=subprocess.PIPE, text=True)
+    if script.returncode != 0 or os.path.getsize(out) == 0:
         detail = "\n".join(part for part in (script.stderr, proc.stderr, proc.stdout) if part)
         raise SystemExit(explain_failure(detail or "perf script produced no stacks."))
     if proc.returncode != 0:
@@ -2647,7 +2704,7 @@ def record_script(record_cmd: list[str], keep_path: str | None, want_script: boo
             f"perf record exited {proc.returncode}. The graph uses the samples that were captured.",
             file=sys.stderr,
         )
-    return script.stdout
+    return InputFile(out)
 
 
 def output_flag(cmd: list[str]) -> str | None:
@@ -2782,47 +2839,65 @@ COMPRESSED = (
 )
 
 
-def decompress(path: str, kind: str) -> bytes:
-    """Read a .gz, .bz2, .xz, or .zst file. zstd needs the zstandard module or the zstd command."""
+def open_compressed(path: str, kind: str):
+    """A binary stream of a .gz, .bz2, .xz, or .zst file, or None for zstd without the module."""
     if kind == "gzip":
         import gzip
 
-        with gzip.open(path, "rb") as handle:
-            return handle.read()
+        return gzip.open(path, "rb")
     if kind == "bzip2":
         import bz2
 
-        with bz2.open(path, "rb") as handle:
-            return handle.read()
+        return bz2.open(path, "rb")
     if kind == "xz":
         import lzma
 
-        with lzma.open(path, "rb") as handle:
-            return handle.read()
+        return lzma.open(path, "rb")
     try:
         import zstandard  # type: ignore[import-not-found]
 
-        with open(path, "rb") as handle:
-            return zstandard.ZstdDecompressor().stream_reader(handle).read()
+        return zstandard.ZstdDecompressor().stream_reader(open(path, "rb"), closefd=True)
     except ImportError:
-        pass
-    if shutil.which("zstd") is None:
-        raise SystemExit(f"{path} is zstd-compressed. Install zstd, or run: zstd -d {shlex.quote(path)}")
-    proc = subprocess.run(["zstd", "-dc", path], capture_output=True)
-    if proc.returncode != 0:
-        raise SystemExit(proc.stderr.decode(errors="replace").strip() or "zstd failed")
-    return proc.stdout
+        return None
 
 
-def perf_script_of(path: str) -> str:
+_TEMP_DIRS: list[tempfile.TemporaryDirectory] = []
+
+
+def temp_path(name: str) -> str:
+    """A path in a directory that is removed when cpuflame exits."""
+    holder = tempfile.TemporaryDirectory(prefix="cpuflame-")
+    _TEMP_DIRS.append(holder)
+    return os.path.join(holder.name, name)
+
+
+def decompress_to(path: str, kind: str, out: str) -> None:
+    stream = open_compressed(path, kind)
+    if stream is None:
+        if shutil.which("zstd") is None:
+            raise SystemExit(f"{path} is zstd-compressed. Install zstd, or run: zstd -d {shlex.quote(path)}")
+        with open(out, "wb") as handle:
+            proc = subprocess.run(["zstd", "-dc", path], stdout=handle, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise SystemExit(proc.stderr.decode(errors="replace").strip() or "zstd failed")
+        return
+    with stream, open(out, "wb") as handle:
+        shutil.copyfileobj(stream, handle, 1 << 20)
+
+
+def perf_script_of(path: str) -> InputFile:
+    """Run perf script into a temporary file and read it from there."""
     require_perf()
-    script = subprocess.run(["perf", "script", "-i", path], text=True, capture_output=True)
-    if script.returncode != 0:
+    out = temp_path("perf.script")
+    with open(out, "w", encoding="utf-8") as handle:
+        script = subprocess.run(["perf", "script", "-i", path], stdout=handle, stderr=subprocess.PIPE, text=True)
+    if script.returncode != 0 or os.path.getsize(out) == 0:
         raise SystemExit((script.stderr or "perf script failed").strip())
-    return script.stdout
+    return InputFile(out)
 
 
-def read_graph_input(path: str) -> str:
+def read_graph_input(path: str):
+    """The input as a str (stdin) or an InputFile read line by line."""
     if path == "-":
         return sys.stdin.read()
     if not os.path.exists(path):
@@ -2833,19 +2908,16 @@ def read_graph_input(path: str) -> str:
         return perf_script_of(path)
     for prefix, kind in COMPRESSED:
         if magic.startswith(prefix):
-            data = decompress(path, kind)
-            if data.startswith(b"PERFILE"):
-                with tempfile.TemporaryDirectory(prefix="cpuflame-") as temp_dir:
-                    raw = os.path.join(temp_dir, "perf.data")
-                    with open(raw, "wb") as handle:
-                        handle.write(data)
-                    return perf_script_of(raw)
-            return data.decode("utf-8", errors="replace")
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        return handle.read()
+            plain = temp_path("input")
+            decompress_to(path, kind, plain)
+            with open(plain, "rb") as handle:
+                if handle.read(8).startswith(b"PERFILE"):
+                    return perf_script_of(plain)
+            return InputFile(plain)
+    return InputFile(path)
 
 
-def load_args(text: str, args: argparse.Namespace) -> Node:
+def load_args(text, args: argparse.Namespace) -> Node:
     return load_text(
         text,
         args.format,
@@ -3391,7 +3463,9 @@ other 8 [001] 10.530000:          1 cpu-clock:
         packed = os.path.join(temp_dir, "perf.script.gz")
         with _gzip.open(packed, "wt", encoding="utf-8") as handle:
             handle.write(script)
-        expect("decode_utf8" in read_graph_input(packed), "gzip input was not read")
+        expect(any("decode_utf8" in line for line in lines_of(read_graph_input(packed))), "gzip input was not read")
+        packed_tree = load_text(read_graph_input(packed), "auto", True, set())
+        expect(find_frame(packed_tree, "decode_utf8") is not None, "gzip perf script was not parsed")
 
     page = render_html(analyze(example_tree(), 8), "<svg data-plot-width=\"1\"></svg>\n")
     expect("What is wrong" in page and "memcmp" in page and "<svg" in page, "html report is missing the graph or the finding")
